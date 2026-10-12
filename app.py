@@ -244,6 +244,45 @@ def flight_to_dict(f) -> Dict[str, Any]:
     }
 
 
+_GOOGLE_FLIGHTS_URL = "https://www.google.com/travel/flights"
+# Google shows a consent interstitial to EU / datacenter IPs, which breaks the
+# scraper. Sending the SOCS cookie skips it. Best-effort and version-guarded.
+_CONSENT_COOKIES = {
+    "SOCS": "CAISHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmVuIAEaBgiA_LyaBg",
+}
+
+
+def _consent_fetch_integration():
+    """Return a fast_flights FetchIntegration that sends a consent cookie.
+
+    Returns None if the installed fast_flights/primp version doesn't support it,
+    so callers can fall back to the default fetcher.
+    """
+    try:
+        import primp
+        from fast_flights.integrations.base import FetchIntegration
+        from fast_flights.querying import Query
+
+        class _ConsentFetch(FetchIntegration):
+            def fetch_html(self, q, /):
+                client = primp.Client(
+                    impersonate="chrome_145",
+                    impersonate_os="macos",
+                    referer=True,
+                    cookie_store=True,
+                )
+                params = q.params() if isinstance(q, Query) else {"q": q}
+                res = client.get(
+                    _GOOGLE_FLIGHTS_URL, params=params, cookies=_CONSENT_COOKIES
+                )
+                return res.text
+
+        return _ConsentFetch()
+    except Exception as e:
+        print(f"Consent integration unavailable, using default fetch: {e}")
+        return None
+
+
 def search_flights(
     origin: str,
     dest: str,
@@ -289,10 +328,18 @@ def search_flights(
         currency=currency,
     )
     try:
-        results = get_flights(query)
+        integration = _consent_fetch_integration()
+        if integration is not None:
+            results = get_flights(query, integration=integration)
+        else:
+            results = get_flights(query)
     except Exception as e:
-        print(f"Search error: {e}")
-        return []
+        print(f"Consent fetch failed ({e}); retrying with default fetcher")
+        try:
+            results = get_flights(query)
+        except Exception as e2:
+            print(f"Search error: {e2}")
+            return []
 
     out = []
     for f in results:

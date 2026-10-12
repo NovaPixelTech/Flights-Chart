@@ -1,4 +1,5 @@
 flask>=3.0
-fast-flights>=3.0.0rc0
+fast-flights>=3.1.0,<4
+typing_extensions>=4.0
 requests>=2.31.0
 gunicorn>=21.2.0; sys_platform != "win32"

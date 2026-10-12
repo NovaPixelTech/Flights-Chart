@@ -32,22 +32,28 @@ The app is split into **two deployable pieces**:
 
 ## Deploy the backend (one time)
 
-Pick any free host that runs a Python web server.
+Pick any free host that runs a Python web server. This repo ships a **`Dockerfile`**, so
+any Docker-based platform works with no build configuration.
 
-**Fastest path — Render Blueprint** (config is already in `render.yaml`):
+### Zeabur (recommended — no credit card)
 
-1. On [render.com](https://render.com) → **New → Blueprint** → connect this repo.
-2. Render reads `render.yaml` and creates the `flights-chart-backend` web service
-   (`gunicorn app:app`, health check `/api/ping`).
-3. Copy the resulting URL, e.g. `https://flights-chart-backend.onrender.com`.
+1. Sign up at [zeabur.com](https://zeabur.com) with GitHub (**no credit card required**).
+2. **Create Project → Deploy from GitHub** and pick this repo. Zeabur detects the
+   `Dockerfile` and builds the backend automatically.
+3. Zeabur injects `$PORT`; the container already binds to it. Copy the public URL, e.g.
+   `https://flights-chart-backend.zeabur.app`.
+4. The free plan **auto-sleeps when idle and wakes on the next request** (a few seconds).
 
-**Manual path — any host** (Render/Railway/Fly/VPS): create a Python web service with
+### Manual path — any host (Render/Railway/Fly/VPS/Cloud Run)
+
+Either use the bundled `Dockerfile`, or create a Python web service with:
 
 - **Build command**: `pip install -r requirements.txt`
 - **Start command**: `gunicorn app:app`
 
-> **Free instance sleeps when idle**; the first request after a pause takes ~30–60 s to
-> wake up. That is expected.
+> A free instance usually **sleeps when idle**; the first request after a pause can take
+> ~30–60 s to wake up. That is expected. A single search also runs many sequential Google
+> requests, so allow generous request timeouts (the Dockerfile sets `--timeout 300`).
 
 (For local testing just run `pip install -r requirements.txt` then `python app.py` →
 `http://127.0.0.1:5000`.)
@@ -111,6 +117,10 @@ In the site, open **⚙️ Backend settings** and enter `http://127.0.0.1:5000`.
 
 - There is **no official Google Flights API**. This uses an unofficial scraper. Google may
   rate-limit or block requests, and free hosts spin down.
+- **Google's consent wall.** From EU / datacenter IPs Google serves a consent interstitial
+  instead of results, which breaks the scraper. The backend works around this by sending a
+  `SOCS` consent cookie (see `_CONSENT_COOKIES` in `app.py`) and falls back to the default
+  fetcher if that is unavailable. If results suddenly stop, that cookie may need refreshing.
 - Prices are live estimates only — not bookable through this app.
 - City resolution works best for major cities; prefer IATA codes (JFK, LHR, CDG, …) for reliability.
 - Round-trip results sometimes surface mainly the outbound leg details depending on how
