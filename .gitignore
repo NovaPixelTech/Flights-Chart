@@ -1,0 +1,11 @@
+# Python / Flask backend
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+
+# Misc
+.DS_Store
+Thumbs.db

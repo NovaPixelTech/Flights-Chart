@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cheap Flights Finder</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>✈️ Cheap Flights Finder</h1>
+      <p>Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Open-jaw supported</p>
+      <div class="status-row">
+        <span class="pill" id="backendPill"><span class="dot"></span><span id="backendPillText">backend: checking…</span></span>
+        <span class="pill" id="airportPill"><span class="dot"></span><span id="airportPillText">airports: loading…</span></span>
+      </div>
+    </header>
+
+    <div class="card">
+      <form id="searchForm">
+        <div class="form-grid">
+          <div>
+            <label for="origin">From (country, city or airport)</label>
+            <input id="origin" name="origin" placeholder="e.g. Germany or BER" required autocomplete="off" />
+            <div class="resolve-hint" id="originHint"></div>
+          </div>
+          <div>
+            <label for="destination">To (country, city or airport)</label>
+            <input id="destination" name="destination" placeholder="e.g. Athens or Greece" required autocomplete="off" />
+            <div class="resolve-hint" id="destinationHint"></div>
+          </div>
+          <div>
+            <label for="min_days">Stay min (days)</label>
+            <input id="min_days" name="min_days" type="number" min="1" max="30" value="6" required />
+          </div>
+          <div>
+            <label for="max_days">Stay max (days)</label>
+            <input id="max_days" name="max_days" type="number" min="1" max="30" value="7" required />
+          </div>
+          <div>
+            <label for="date_from">Date window from (max 31 days total)</label>
+            <input id="date_from" name="date_from" type="date" />
+          </div>
+          <div>
+            <label for="date_to">Date window to (≤31 calendar days from start)</label>
+            <input id="date_to" name="date_to" type="date" />
+          </div>
+          <div>
+            <label for="currency">Currency</label>
+            <select id="currency" name="currency">
+              <option value="EUR">EUR</option>
+              <option value="USD">USD</option>
+              <option value="GBP">GBP</option>
+              <option value="CAD">CAD</option>
+              <option value="AUD">AUD</option>
+              <option value="JPY">JPY</option>
+            </select>
+          </div>
+          <div>
+            <label for="open_jaw">Allow open-jaw (diff. return airport)</label>
+            <select id="open_jaw" name="open_jaw">
+              <option value="true">Yes</option>
+              <option value="false">No (same airport return)</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" class="btn" id="submitBtn">
+          <span id="btnText">Search cheapest flights</span>
+          <span id="btnSpin" class="spinner" style="display:none"></span>
+        </button>
+      </form>
+
+      <details class="settings">
+        <summary>⚙️ Backend settings</summary>
+        <div class="settings-body">
+          <label for="backendUrl">Flights API URL (deployed Flask backend)</label>
+          <input id="backendUrl" placeholder="https://your-backend.onrender.com" autocomplete="off" spellcheck="false" />
+          <p class="hint">
+            This site runs entirely in your browser. Live flight prices are fetched from the Flask
+            backend you deploy (see README). The URL is saved in <em>your</em> browser only.
+          </p>
+        </div>
+      </details>
+    </div>
+
+    <div id="errorBox" class="error" style="display:none"></div>
+
+    <div id="results">
+      <div class="result-header" id="resultMeta"></div>
+      <div id="flightResults"></div>
+      <p class="note" id="resultNote"></p>
+    </div>
+  </div>
+
+  <script src="./config.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

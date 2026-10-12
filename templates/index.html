@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cheap Flights Finder</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --accent: #38bdf8;
+      --accent2: #22c55e;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --border: #334155;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(160deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+    .container {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 4rem;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+    header h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      background: linear-gradient(90deg, #38bdf8, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    header p {
+      color: var(--muted);
+      margin-top: 0.5rem;
+      font-size: 1rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      padding: 1.75rem;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    @media (max-width: 640px) {
+      .form-grid { grid-template-columns: 1fr; }
+    }
+    label {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input, select {
+      width: 100%;
+      padding: 0.75rem 1rem;
+      border-radius: 0.6rem;
+      border: 1px solid var(--border);
+      background: #0f172a;
+      color: var(--text);
+      font-size: 1rem;
+      transition: border-color 0.15s;
+    }
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .full { grid-column: 1 / -1; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      width: 100%;
+      padding: 0.9rem 1.25rem;
+      margin-top: 1.25rem;
+      border: none;
+      border-radius: 0.6rem;
+      background: linear-gradient(135deg, #0ea5e9, #6366f1);
+      color: white;
+      font-size: 1.05rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.12s, opacity 0.12s;
+    }
+    .btn:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .spinner {
+      width: 1.1rem; height: 1.1rem;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: white;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #results { margin-top: 2rem; display: none; }
+    .result-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1.5rem;
+      align-items: center;
+      margin-bottom: 1.25rem;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .result-header strong { color: var(--text); }
+    .flight-card {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 0.85rem;
+      padding: 1.25rem 1.4rem;
+      margin-bottom: 1rem;
+    }
+    .flight-card.best-direct { border-color: #22c55e55; }
+    .flight-card.best-stops { border-color: #38bdf855; }
+    .badge {
+      display: inline-block;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      margin-bottom: 0.6rem;
+    }
+    .badge.green { background: #166534; color: #86efac; }
+    .badge.blue { background: #1e3a5f; color: #7dd3fc; }
+    .price {
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--accent2);
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin: 0.35rem 0 0.75rem;
+    }
+    .leg {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem 1rem;
+      padding: 0.55rem 0;
+      border-top: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+    .leg:first-of-type { border-top: none; }
+    .layover {
+      color: #fbbf24;
+      font-size: 0.85rem;
+      padding: 0.25rem 0 0.25rem 0.5rem;
+      border-left: 2px solid #fbbf24;
+      margin: 0.2rem 0;
+    }
+    .error {
+      background: #450a0a;
+      border: 1px solid #7f1d1d;
+      color: #fecaca;
+      padding: 1rem 1.25rem;
+      border-radius: 0.75rem;
+      margin-top: 1.25rem;
+    }
+    .note {
+      margin-top: 1.5rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-align: center;
+    }
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 2rem 1rem;
+    }
+    .results-table-wrap {
+      overflow-x: auto;
+      margin: 1rem 0 1.5rem;
+      border-radius: 0.75rem;
+      border: 1px solid var(--border);
+    }
+    table.results-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+      background: #0f172a;
+    }
+    table.results-table th {
+      background: #1e293b;
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 0.72rem;
+      padding: 0.7rem 0.75rem;
+      text-align: left;
+      white-space: nowrap;
+      border-bottom: 1px solid var(--border);
+    }
+    table.results-table td {
+      padding: 0.65rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    table.results-table tr:last-child td { border-bottom: none; }
+    table.results-table tr:hover td { background: #1e293b55; }
+    table.results-table .price-cell {
+      font-weight: 700;
+      color: var(--accent2);
+      white-space: nowrap;
+    }
+    table.results-table .rank-cell {
+      color: var(--muted);
+      font-weight: 600;
+      width: 2rem;
+    }
+    .section-title {
+      margin: 1.5rem 0 0.6rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>✈️ Cheap Flights Finder</h1>
+      <p>Country → all commercial airports · City → primary airport · Flexible dates & stay length · Open-jaw supported</p>
+    </header>
+
+    <div class="card">
+      <form id="searchForm">
+        <div class="form-grid">
+          <div>
+            <label for="origin">From (country, city or airport)</label>
+            <input id="origin" name="origin" placeholder="e.g. Germany or BER" required autocomplete="off" />
+          </div>
+          <div>
+            <label for="destination">To (country, city or airport)</label>
+            <input id="destination" name="destination" placeholder="e.g. Athens or Greece" required autocomplete="off" />
+          </div>
+          <div>
+            <label for="min_days">Stay min (days)</label>
+            <input id="min_days" name="min_days" type="number" min="1" max="30" value="6" required />
+          </div>
+          <div>
+            <label for="max_days">Stay max (days)</label>
+            <input id="max_days" name="max_days" type="number" min="1" max="30" value="7" required />
+          </div>
+          <div>
+            <label for="date_from">Date window from (max 31 days total)</label>
+            <input id="date_from" name="date_from" type="date" />
+          </div>
+          <div>
+            <label for="date_to">Date window to (≤31 calendar days from start)</label>
+            <input id="date_to" name="date_to" type="date" />
+          </div>
+          <div>
+            <label for="currency">Currency</label>
+            <select id="currency" name="currency">
+              <option value="EUR">EUR</option>
+              <option value="USD">USD</option>
+              <option value="GBP">GBP</option>
+              <option value="CAD">CAD</option>
+              <option value="AUD">AUD</option>
+              <option value="JPY">JPY</option>
+            </select>
+          </div>
+          <div>
+            <label for="open_jaw">Allow open-jaw (diff. return airport)</label>
+            <select id="open_jaw" name="open_jaw">
+              <option value="true">Yes</option>
+              <option value="false">No (same airport return)</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" class="btn" id="submitBtn">
+          <span id="btnText">Search cheapest flights</span>
+          <span id="btnSpin" class="spinner" style="display:none"></span>
+        </button>
+      </form>
+    </div>
+
+    <div id="errorBox" class="error" style="display:none"></div>
+
+    <div id="results">
+      <div class="result-header" id="resultMeta"></div>
+      <div id="flightResults"></div>
+      <p class="note" id="resultNote"></p>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("searchForm");
+    const submitBtn = document.getElementById("submitBtn");
+    const btnText = document.getElementById("btnText");
+    const btnSpin = document.getElementById("btnSpin");
+    const errorBox = document.getElementById("errorBox");
+    const results = document.getElementById("results");
+    const resultMeta = document.getElementById("resultMeta");
+    const flightResults = document.getElementById("flightResults");
+    const resultNote = document.getElementById("resultNote");
+
+    // Default date window: ~45 days out, max 30 days span (≤31 calendar days)
+    const d1 = new Date();
+    d1.setDate(d1.getDate() + 45);
+    const d2 = new Date(d1);
+    d2.setDate(d2.getDate() + 30);  // inclusive window ≤ 31 calendar days
+    document.getElementById("date_from").value = d1.toISOString().slice(0, 10);
+    document.getElementById("date_to").value = d2.toISOString().slice(0, 10);
+
+    function formatDuration(min) {
+      if (min == null) return "—";
+      const h = Math.floor(min / 60);
+      const m = min % 60;
+      return h + "h " + m + "m";
+    }
+
+    function renderFlight(f, badgeClass, badgeText) {
+      if (!f) return "";
+      let legsHtml = "";
+      (f.legs || []).forEach((leg, i) => {
+        if (i > 0 && f.layovers_min && f.layovers_min[i - 1] != null) {
+          legsHtml += `<div class="layover">Layover: ${formatDuration(f.layovers_min[i - 1])}</div>`;
+        }
+        legsHtml += `
+          <div class="leg">
+            <strong>${leg.from} → ${leg.to}</strong>
+            <span>${leg.departure} → ${leg.arrival}</span>
+            <span>${formatDuration(leg.duration_min)}</span>
+            ${leg.plane ? `<span style="color:var(--muted)">${leg.plane}</span>` : ""}
+          </div>`;
+      });
+      const stopsLabel = f.stops === 0 ? "Direct" : (f.stops === 1 ? "1 stop" : (f.stops || 0) + " stops");
+      const route = f.origin_airport
+        ? `${f.origin_airport}${f.return_airport && f.return_airport !== f.origin_airport ? " ↩ " + f.return_airport : ""} → ${f.dest_airport || ""}`
+        : "";
+      const dates = f.outbound_date ? `${f.outbound_date} → ${f.return_date || ""} (${f.stay_days || "?"}d)` : "";
+      const oj = f.open_jaw ? " · Open-jaw" : "";
+      return `
+        <div class="flight-card ${badgeClass}">
+          <span class="badge ${badgeClass === "best-direct" ? "green" : "blue"}">${badgeText}</span>
+          <div class="price">${f.price != null ? f.price + " " + (window._currency || "USD") : "N/A"}</div>
+          <div class="meta">
+            ${route ? route + " · " : ""}${dates ? dates + " · " : ""}${(f.airlines || []).join(", ")} · ${stopsLabel}${oj} · Total ${formatDuration(f.total_duration_min)}
+          </div>
+          ${legsHtml}
+        </div>`;
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      errorBox.style.display = "none";
+      results.style.display = "none";
+      submitBtn.disabled = true;
+      btnText.style.display = "none";
+      btnSpin.style.display = "inline-block";
+
+      const payload = {
+        origin: document.getElementById("origin").value.trim(),
+        destination: document.getElementById("destination").value.trim(),
+        min_days: parseInt(document.getElementById("min_days").value, 10) || 6,
+        max_days: parseInt(document.getElementById("max_days").value, 10) || 7,
+        date_from: document.getElementById("date_from").value || null,
+        date_to: document.getElementById("date_to").value || null,
+        currency: document.getElementById("currency").value,
+        open_jaw: document.getElementById("open_jaw").value === "true",
+      };
+      window._currency = payload.currency;
+
+      try {
+        const res = await fetch("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "Search failed");
+        }
+
+        const originList = (data.origins_searched || []).map(a => a.code).join(", ");
+        const destList = (data.destinations_searched || []).map(a => a.code).join(", ");
+        resultMeta.innerHTML = `
+          <span><strong>${data.origin_input}</strong> → <strong>${data.destination_input}</strong></span>
+          <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
+          <span>Window <strong>${data.date_from}</strong> – <strong>${data.date_to}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days</span>
+          <span>${data.searches_performed || 0} searches · ${data.all_results_count || 0} options found</span>
+        `;
+
+        const cur = data.currency || window._currency || "";
+        let html = "";
+
+        // Highlight cards for top direct / connecting
+        if (data.cheapest_direct) {
+          html += renderFlight(data.cheapest_direct, "best-direct", "Cheapest direct");
+        }
+        if (data.cheapest_with_stops) {
+          html += renderFlight(data.cheapest_with_stops, "best-stops", "Cheapest ≤2 stops / open-jaw");
+        }
+
+        // Helper: extract times from legs
+        function legTimes(f) {
+          const legs = f.legs || [];
+          if (!legs.length) return { outDep: "—", outArr: "—", retDep: "—", retArr: "—" };
+          const first = legs[0];
+          const last = legs[legs.length - 1];
+          return {
+            outDep: (first.departure || "—").split(" ").pop() || first.departure || "—",
+            outArr: (first.arrival || "—").split(" ").pop() || first.arrival || "—",
+            retDep: legs.length > 1 ? ((last.departure || "—").split(" ").pop() || last.departure) : "—",
+            retArr: legs.length > 1 ? ((last.arrival || "—").split(" ").pop() || last.arrival) : "—",
+          };
+        }
+
+        // === Main sorted results TABLE ===
+        const ranked = data.ranked_options || [];
+        if (ranked.length) {
+          html += `<div class="section-title">All cheapest options (sorted by price) — with flight times</div>`;
+          html += `<div class="results-table-wrap"><table class="results-table"><thead><tr>
+            <th>#</th>
+            <th>Price</th>
+            <th>From → To</th>
+            <th>Return apt</th>
+            <th>Outbound date</th>
+            <th>Out dep</th>
+            <th>Out arr</th>
+            <th>Return date</th>
+            <th>Ret dep</th>
+            <th>Ret arr</th>
+            <th>Stay</th>
+            <th>Stops</th>
+            <th>Airlines</th>
+            <th>Type</th>
+          </tr></thead><tbody>`;
+          ranked.forEach((f, i) => {
+            const from = f.origin_airport || "—";
+            const to = f.dest_airport || "—";
+            const ret = f.return_airport || from;
+            const stops = f.stops === 0 ? "Direct" : (f.stops || 0) + " stop(s)";
+            const airlines = (f.airlines || []).join(", ") || "—";
+            const type = f.open_jaw ? "Open-jaw" : "Round-trip";
+            const t = legTimes(f);
+            html += `<tr>
+              <td class="rank-cell">${i + 1}</td>
+              <td class="price-cell">${f.price != null ? f.price + " " + cur : "—"}</td>
+              <td><strong>${from}</strong> → <strong>${to}</strong></td>
+              <td>${ret}</td>
+              <td>${f.outbound_date || "—"}</td>
+              <td>${t.outDep}</td>
+              <td>${t.outArr}</td>
+              <td>${f.return_date || "—"}</td>
+              <td>${t.retDep}</td>
+              <td>${t.retArr}</td>
+              <td>${f.stay_days != null ? f.stay_days + "d" : "—"}</td>
+              <td>${stops}</td>
+              <td>${airlines}</td>
+              <td>${type}</td>
+            </tr>`;
+          });
+          html += `</tbody></table></div>`;
+        } else {
+          html += `<div class="flight-card"><div class="empty">No flights found in the sampled dates/airports.</div></div>`;
+        }
+
+        // === Per-origin summary TABLE ===
+        if (data.per_origin_summary && data.per_origin_summary.length) {
+          html += `<div class="section-title">Per departure airport (best found) — with times</div>`;
+          html += `<div class="results-table-wrap"><table class="results-table"><thead><tr>
+            <th>Airport</th>
+            <th>City</th>
+            <th>Best price</th>
+            <th>Stops</th>
+            <th>Outbound</th>
+            <th>Out times</th>
+            <th>Return</th>
+            <th>Stay</th>
+            <th>Airlines</th>
+            <th>Status</th>
+          </tr></thead><tbody>`;
+          data.per_origin_summary.forEach(row => {
+            const a = row.airport || {};
+            const best = row.cheapest_any;
+            if (best) {
+              const t = legTimes(best);
+              const times = t.outDep + "→" + t.outArr;
+              html += `<tr>
+                <td><strong>${a.code || "—"}</strong></td>
+                <td>${a.city || a.name || "—"}</td>
+                <td class="price-cell">${best.price != null ? best.price + " " + cur : "—"}</td>
+                <td>${best.stops === 0 ? "Direct" : (best.stops || 0) + " stop(s)"}</td>
+                <td>${best.outbound_date || "—"}</td>
+                <td>${times}</td>
+                <td>${best.return_date || "—"}</td>
+                <td>${best.stay_days != null ? best.stay_days + "d" : "—"}</td>
+                <td>${(best.airlines || []).join(", ") || "—"}</td>
+                <td>Verified</td>
+              </tr>`;
+            } else {
+              html += `<tr style="opacity:0.55">
+                <td><strong>${a.code || "—"}</strong></td>
+                <td>${a.city || a.name || "—"}</td>
+                <td colspan="7">—</td>
+                <td>No verified flights</td>
+              </tr>`;
+            }
+          });
+          html += `</tbody></table></div>`;
+        }
+
+        flightResults.innerHTML = html;
+        resultNote.textContent = data.note || "";
+        results.style.display = "block";
+      } catch (err) {
+        errorBox.textContent = err.message || "Something went wrong";
+        errorBox.style.display = "block";
+      } finally {
+        submitBtn.disabled = false;
+        btnText.style.display = "inline";
+        btnSpin.style.display = "none";
+      }
+    });
+  </script>
+</body>
+</html>
