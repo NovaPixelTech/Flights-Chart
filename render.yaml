@@ -1,0 +1,15 @@
+# Render Blueprint — one-click deploy of the Flask flight backend.
+# 1. Push this repo to GitHub (done).
+# 2. On render.com: New > Blueprint > pick this repo.
+# 3. Copy the resulting URL into docs/config.js (window.FLIGHT_BACKEND).
+services:
+  - type: web
+    name: flights-chart-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /api/ping
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"

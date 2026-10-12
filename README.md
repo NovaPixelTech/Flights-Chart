@@ -32,17 +32,25 @@ The app is split into **two deployable pieces**:
 
 ## Deploy the backend (one time)
 
-Pick any free host that runs a Python web server. Example with **Render**:
+Pick any free host that runs a Python web server.
 
-1. Push this repo to GitHub.
-2. On [render.com](https://render.com) → **New → Web Service** → connect the repo.
-3. Set:
-   - **Build command**: `pip install -r requirements.txt`
-   - **Start command**: `gunicorn app:app`
-4. **Free instance spins down when idle**; the first request after a pause takes ~30–60 s to wake up. That is expected.
-5. Note the public URL, e.g. `https://flights-finder.onrender.com`.
+**Fastest path — Render Blueprint** (config is already in `render.yaml`):
 
-(You can also run it locally in a terminal for testing: `pip install -r requirements.txt` then `python app.py` → `http://127.0.0.1:5000`.)
+1. On [render.com](https://render.com) → **New → Blueprint** → connect this repo.
+2. Render reads `render.yaml` and creates the `flights-chart-backend` web service
+   (`gunicorn app:app`, health check `/api/ping`).
+3. Copy the resulting URL, e.g. `https://flights-chart-backend.onrender.com`.
+
+**Manual path — any host** (Render/Railway/Fly/VPS): create a Python web service with
+
+- **Build command**: `pip install -r requirements.txt`
+- **Start command**: `gunicorn app:app`
+
+> **Free instance sleeps when idle**; the first request after a pause takes ~30–60 s to
+> wake up. That is expected.
+
+(For local testing just run `pip install -r requirements.txt` then `python app.py` →
+`http://127.0.0.1:5000`.)
 
 ## Point the frontend at the backend
 
