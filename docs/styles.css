@@ -292,3 +292,11 @@ table.results-table .rank-cell {
   letter-spacing: 0.05em;
 }
 details summary::-webkit-details-marker { display: none; }
+
+/* live progress line under the search button */
+.progress {
+  margin-top: 0.9rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  text-align: center;
+}

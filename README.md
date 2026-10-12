@@ -5,144 +5,99 @@ Web app that finds the **cheapest direct flight** and the **cheapest flight with
 Supports country inputs (expands to that country's commercial airports), flexible date
 windows, stay-length ranges, and open-jaw (different return airport).
 
-## Architecture
+**Live flight prices. Completely static. No backend, no accounts, no API keys, no credit card.**
+It runs entirely in the browser on GitHub Pages.
 
-The app is split into **two deployable pieces**:
+## How it works (no server!)
+
+GitHub Pages can only serve static files, and a browser can't fetch Google Flights directly
+(CORS + it's a JavaScript app). So instead:
 
 ```
-┌─────────────────────────────┐       ┌──────────────────────────────────┐
-│  GitHub Pages (static)      │  CORS │  Flask backend (free host)       │
-│  docs/                      │ ─────►│  app.py                           │
-│  - HTML/CSS/JS in browser   │ POST  │  - fast-flights → Google Flights │
-│  - city/country → IATA      │       │  - samples dates, filters prices │
-│    resolution, client-side  │       │  - /api/search, /api/ping        │
-└─────────────────────────────┘       └──────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Your browser (GitHub Pages)                                     │
+│                                                                  │
+│  1. resolve city/country → IATA          (client-side)           │
+│  2. build Google Flights' ?tfs= query     (protobuf encoder)      │
+│  3. ask a public "reader" to render the   ──────► r.jina.ai       │
+│     Google Flights results page                    (free, keyless)│
+│  4. parse prices from the returned HTML   (flight parser)         │
+│  5. render the tables                     (client-side)           │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-- **Frontend (`docs/`)** — a fully static site served by GitHub Pages. It resolves
-  city/country/IATA inputs to airport codes in the browser (airports dataset is fetched
-  directly with CORS). *No server-side code runs here.*
-- **Backend (`app.py`)** — the same Python app as before, now deployed to any always-on
-  host (Render, Railway, Fly.io, a VPS, …). It scrapes Google Flights via the open-source
-  [`fast-flights`](https://github.com/AWeirdDev/flights) library and exposes the results
-  over CORS-enabled JSON endpoints that the static frontend calls.
+Everything runs in `docs/app.js`. It is a self-contained JavaScript port of the
+[`fast-flights`](https://github.com/AWeirdDev/flights) library:
 
-> GitHub Pages cannot run Python, and Google Flights blocks direct browser fetches —
-> that is why live prices require the backend.
+- **Protobuf encoder** — builds the `?tfs=` parameter Google Flights expects
+  (byte-identical to the Python library; verified against known values).
+- **Reader fetch** — asks a public reader service (`https://r.jina.ai/`, free and
+  key-less) to fetch and render the Google Flights results page server-side, so CORS and
+  Google's JavaScript don't matter. The reader returns the rendered HTML with CORS enabled.
+- **Parser** — extracts the flight data (`AF_initDataCallback` / `ds:1` payload) from that
+  HTML and maps it to itineraries, prices and airlines. Verified to produce the same results
+  as the Python library.
 
-## Deploy the backend (one time)
+> **No secret is embedded and nothing is exposed.** The reader request and the (already
+> public) Google Flights page are the only network calls.
 
-The backend is a Flask app that scrapes Google Flights. Any host that can run Python and
-reach the internet works. The free options that need **no credit card** are limited — the
-two below are the practical choices.
+## Use it
 
-### Vercel (recommended — no credit card)
-
-Vercel detects the Flask `app` in `app.py` and deploys it as a function **with zero
-configuration**. `vercel.json` raises the function timeout to 300 s (Hobby max).
-
-1. Sign up at [vercel.com](https://vercel.com/signup) with GitHub — **no credit card**.
-2. **Add New → Project** and import this repository.
-3. Leave every setting at its default (Vercel auto-detects Flask) and click **Deploy**.
-4. Copy the production URL, e.g. `https://flights-chart-backend.vercel.app`.
-
-> Vercel's Hobby plan is **non-commercial use only** (fine for a personal project). The free
-> plan is 1M function invocations/month; a search is a single invocation.
-
-### Docker host (Render / Railway / Fly / VPS / Cloud Run)
-
-This repo ships a **`Dockerfile`**, so any Docker-based platform works. Create a Python web
-service instead if you prefer:
-
-- **Build command**: `pip install -r requirements.txt`
-- **Start command**: `gunicorn app:app`
-
-> Free container hosts usually **sleep when idle**; the first request after a pause can take
-> ~30–60 s to wake. That is expected. A single search also runs many sequential Google
-> requests, so allow generous request timeouts (the Dockerfile sets `--timeout 300`).
->
-> ⚠️ **Zeabur no longer works for this.** Its free tier is serverless-only (no containers),
-> and creating a project now requires buying a paid server (~$14/mo). Render's free tier
-> may also ask new accounts to verify a card. Vercel is the card-free path.
-
-The backend also reads two optional environment variables to stay inside serverless limits:
-
-- `MAX_SEARCHES` (default `40`) — hard cap on Google requests per request.
-- `SEARCH_TIME_BUDGET_S` (default `100`) — stop searching after this many seconds and return
-  what was found, so the request never hits a platform timeout.
-
-(For local testing just run `pip install -r requirements.txt` then `python app.py` →
-`http://127.0.0.1:5000`.)
-
-## Point the frontend at the backend
-
-After deploying, tell the static site where the backend lives — **either**:
-
-- Edit `docs/config.js` and set `window.FLIGHT_BACKEND` to the backend URL, **or**
-- Let visitors type the URL themselves in the in-page **⚙️ Backend settings**
-  (saved in their browser only).
-
-If no URL is configured the app explains exactly what to do, so the page never looks broken.
+Open the GitHub Pages URL, type a country/city/airport, pick your dates and stay, and search.
 
 ## Publish on GitHub Pages
 
-1. **Create the repository**
-   ```bash
-   git init
-   git add .
-   git commit -m "Static GitHub Pages frontend + Flask backend"
-   gh repo create flights-chart --public --source=. --push
-   ```
-   (or create a repo on github.com and `git remote add origin …; git push -u origin main`)
-
-2. **Enable Pages** — one of these two:
-   - **Recommended:** the included workflow `.github/workflows/deploy-pages.yml` deploys
-     `docs/` automatically on every push to `main`. In the repo:
-     **Settings → Pages → Source: "GitHub Actions"**.
-   - Manual alternative: **Settings → Pages → Source: "Deploy from a branch"** →
-     branch `main` → folder `/docs`.
+The included workflow `.github/workflows/deploy-pages.yml` deploys `docs/` on every push to
+`main`. In the repository go to **Settings → Pages → Source: "GitHub Actions"**.
 
 Your site is live at `https://<user>.github.io/<repo>/`.
 
+## Configuration (all optional)
+
+`docs/config.js`:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `FLIGHT_READER` | `https://r.jina.ai/` | The reader/fetcher prefix. |
+| `FLIGHT_READER_KEY` | `""` | Optional reader API key — only **raises rate limits**; never required. |
+| `MAX_SEARCHES` | `12` | Max route/date lookups per search (one reader request each). |
+| `SEARCH_CONCURRENCY` | `3` | How many reader requests run at once. |
+| `SEARCH_TIME_BUDGET_MS` | `90000` | Give up and show partial results after this long. |
+
+Visitors can override the reader, add their own key, or change the lookup cap from the in-page
+**⚙️ Data source settings** panel (saved in their browser only).
+
 ## Local development
 
-```bash
-# terminal 1 — backend
-pip install -r requirements.txt
-python app.py
+Any static server works — there is no build step:
 
-# then open docs/index.html directly in a browser,
-# or serve it statically:
+```bash
 python -m http.server 8000 --directory docs
+# then open http://127.0.0.1:8000/
 ```
 
-In the site, open **⚙️ Backend settings** and enter `http://127.0.0.1:5000`.
+## Limitations
 
-## How it works
-
-- Uses the open-source [`fast-flights`](https://github.com/AWeirdDev/flights) library, which
-  reverse-engineers Google Flights search (no official Google Flights API exists).
-- Resolves city names or IATA codes to airports using a public airports dataset
-  [`mwgg/Airports`](https://github.com/mwgg/Airports).
-- Searches round-trip for the vacation days and date window you specify.
-- Filters:
-  - **Direct**: 0 stops
-  - **With stops**: ≤ 2 stops and every layover ≤ 180 minutes
-
-## Notes / Limitations
-
-- There is **no official Google Flights API**. This uses an unofficial scraper. Google may
-  rate-limit or block requests, and free hosts spin down.
-- **Google's consent wall.** From EU / datacenter IPs Google serves a consent interstitial
-  instead of results, which breaks the scraper. The backend works around this by sending a
-  `SOCS` consent cookie (see `_CONSENT_COOKIES` in `app.py`) and falls back to the default
-  fetcher if that is unavailable. If results suddenly stop, that cookie may need refreshing.
+- **No official Google Flights API exists.** This uses a public reader to render the same
+  page a browser would, then parses it. Google may occasionally show a consent/verification
+  page, and the free reader is rate-limited — the app reports both clearly. Retrying usually
+  works.
+- **Sampled, not exhaustive.** To respect the free reader, the date window (max 31 days) is
+  sampled and the number of lookups is capped (`MAX_SEARCHES`). Country inputs expand to the
+  main commercial airports, capped as well.
+- **Round-trip detail.** Google returns its own round-trip totals; the itinerary shown is the
+  outbound leg (Google pairs the return automatically). Open-jaw totals are estimated from two
+  separate one-ways.
 - Prices are live estimates only — not bookable through this app.
-- City resolution works best for major cities; prefer IATA codes (JFK, LHR, CDG, …) for reliability.
-- Round-trip results sometimes surface mainly the outbound leg details depending on how
-  Google structures the response; the price is for the full trip.
-- Max trip length capped at 30 days, date window capped at 31 calendar days for practical
-  search reasons.
+- City resolution works best for major cities; prefer IATA codes (JFK, LHR, CDG, …) for
+  reliability.
+
+## Optional: self-hosted Python backend (legacy)
+
+Earlier versions of this app used a Flask backend (`app.py`) that scrapes Google Flights with
+`fast-flights` and serves JSON over CORS. That path still works if you prefer to run your own
+backend (Docker, Vercel, a VPS, …) — see `Dockerfile`, `requirements.txt` and `vercel.json` —
+but it is **no longer required**: the GitHub Pages app above is fully self-contained.
 
 ## Example
 

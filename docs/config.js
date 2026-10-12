@@ -1,17 +1,32 @@
 /*
- * Cheap Flights Finder — backend configuration
- * ============================================
+ * Cheap Flights Finder — configuration
+ * ====================================
  *
- * GitHub Pages can only serve static files, so live flight prices come
- * from the Python/Flask backend (app.py), deployed on a free host such as
- * Render, Railway, or Fly.io.
+ * This app is 100% static and runs entirely in the browser (GitHub Pages).
+ * There is NO backend and NO API key needed.
  *
- * EDIT THIS VALUE:
- *   1. Deploy the backend (see README.md → "Deploy the backend").
- *   2. Put the public URL here, e.g. "https://flights-finder.onrender.com"
+ * How it gets live prices without a server:
+ *   The browser asks a public "reader" service to fetch and render the
+ *   Google Flights results page, then this app parses the flight data out
+ *   of the returned HTML. The default reader (r.jina.ai) is free and works
+ *   without an account; an optional API key only raises its rate limits.
  *
- * If you leave it empty, visitors can still type a backend URL in the
- * in-page ⚙️ settings (stored in their browser only). During local dev you
- * can run the backend and enter http://127.0.0.1:5000 in the settings.
+ * You can override any of these at runtime from the in-page
+ * "⚙️ Data source settings" panel (saved in your browser only).
  */
-window.FLIGHT_BACKEND = "";
+
+// Reader/fetcher prefix. The target Google Flights URL is appended after it.
+window.FLIGHT_READER = "https://r.jina.ai/";
+
+// Optional reader API key (leave blank to stay key-less). Only lifts rate limits.
+window.FLIGHT_READER_KEY = "";
+
+// Hard cap on how many route/date lookups a single search performs.
+// Each lookup is one reader request, so keep this modest on the free tier.
+window.MAX_SEARCHES = 12;
+
+// How many reader requests may run at once (be polite to the free service).
+window.SEARCH_CONCURRENCY = 3;
+
+// Give up on a search after this many milliseconds (returns partial results).
+window.SEARCH_TIME_BUDGET_MS = 90000;
