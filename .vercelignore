@@ -1,0 +1,14 @@
+# Keep the Vercel function bundle small (500 MB limit, no tree-shaking).
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+.env
+.env.*
+.pytest_cache
+docs
+render.yaml
+Dockerfile
+.dockerignore

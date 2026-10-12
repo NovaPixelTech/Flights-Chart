@@ -32,28 +32,44 @@ The app is split into **two deployable pieces**:
 
 ## Deploy the backend (one time)
 
-Pick any free host that runs a Python web server. This repo ships a **`Dockerfile`**, so
-any Docker-based platform works with no build configuration.
+The backend is a Flask app that scrapes Google Flights. Any host that can run Python and
+reach the internet works. The free options that need **no credit card** are limited — the
+two below are the practical choices.
 
-### Zeabur (recommended — no credit card)
+### Vercel (recommended — no credit card)
 
-1. Sign up at [zeabur.com](https://zeabur.com) with GitHub (**no credit card required**).
-2. **Create Project → Deploy from GitHub** and pick this repo. Zeabur detects the
-   `Dockerfile` and builds the backend automatically.
-3. Zeabur injects `$PORT`; the container already binds to it. Copy the public URL, e.g.
-   `https://flights-chart-backend.zeabur.app`.
-4. The free plan **auto-sleeps when idle and wakes on the next request** (a few seconds).
+Vercel detects the Flask `app` in `app.py` and deploys it as a function **with zero
+configuration**. `vercel.json` raises the function timeout to 300 s (Hobby max).
 
-### Manual path — any host (Render/Railway/Fly/VPS/Cloud Run)
+1. Sign up at [vercel.com](https://vercel.com/signup) with GitHub — **no credit card**.
+2. **Add New → Project** and import this repository.
+3. Leave every setting at its default (Vercel auto-detects Flask) and click **Deploy**.
+4. Copy the production URL, e.g. `https://flights-chart-backend.vercel.app`.
 
-Either use the bundled `Dockerfile`, or create a Python web service with:
+> Vercel's Hobby plan is **non-commercial use only** (fine for a personal project). The free
+> plan is 1M function invocations/month; a search is a single invocation.
+
+### Docker host (Render / Railway / Fly / VPS / Cloud Run)
+
+This repo ships a **`Dockerfile`**, so any Docker-based platform works. Create a Python web
+service instead if you prefer:
 
 - **Build command**: `pip install -r requirements.txt`
 - **Start command**: `gunicorn app:app`
 
-> A free instance usually **sleeps when idle**; the first request after a pause can take
-> ~30–60 s to wake up. That is expected. A single search also runs many sequential Google
+> Free container hosts usually **sleep when idle**; the first request after a pause can take
+> ~30–60 s to wake. That is expected. A single search also runs many sequential Google
 > requests, so allow generous request timeouts (the Dockerfile sets `--timeout 300`).
+>
+> ⚠️ **Zeabur no longer works for this.** Its free tier is serverless-only (no containers),
+> and creating a project now requires buying a paid server (~$14/mo). Render's free tier
+> may also ask new accounts to verify a card. Vercel is the card-free path.
+
+The backend also reads two optional environment variables to stay inside serverless limits:
+
+- `MAX_SEARCHES` (default `40`) — hard cap on Google requests per request.
+- `SEARCH_TIME_BUDGET_S` (default `100`) — stop searching after this many seconds and return
+  what was found, so the request never hits a platform timeout.
 
 (For local testing just run `pip install -r requirements.txt` then `python app.py` →
 `http://127.0.0.1:5000`.)

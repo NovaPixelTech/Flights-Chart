@@ -7,6 +7,8 @@ Uses fast-flights (Google Flights scraper) to find cheapest direct and connectin
 from flask import Flask, render_template, request, jsonify
 from datetime import date, timedelta, datetime
 from functools import lru_cache
+import os
+import time
 import requests
 import re
 from typing import Optional, List, Dict, Any, Tuple
@@ -450,29 +452,36 @@ def api_search():
     all_results = []  # every found itinerary
     per_origin = {o: {"direct": None, "connecting": None, "any": None} for o in origins}
 
-    # Limit total searches hard (scraper safety)
-    MAX_SEARCHES = 40
+    # Limit total searches hard (scraper safety), and stop before serverless
+    # request timeouts no matter how slow Google is responding.
+    MAX_SEARCHES = int(os.environ.get("MAX_SEARCHES", "40"))
+    SEARCH_TIME_BUDGET_S = float(os.environ.get("SEARCH_TIME_BUDGET_S", "100"))
+    started_at = time.monotonic()
+
+    def time_up() -> bool:
+        return (time.monotonic() - started_at) >= SEARCH_TIME_BUDGET_S
+
     searches_done = 0
 
     for outbound in sample_outbounds:
-        if searches_done >= MAX_SEARCHES:
+        if searches_done >= MAX_SEARCHES or time_up():
             break
         for stay in stay_lengths:
-            if searches_done >= MAX_SEARCHES:
+            if searches_done >= MAX_SEARCHES or time_up():
                 break
             ret = outbound + timedelta(days=stay)
             # If return would fall outside a tight window, still allow (user asked for stay length)
             for o in origins:
-                if searches_done >= MAX_SEARCHES:
+                if searches_done >= MAX_SEARCHES or time_up():
                     break
                 for d in dests:
                     if o == d:
                         continue
-                    if searches_done >= MAX_SEARCHES:
+                    if searches_done >= MAX_SEARCHES or time_up():
                         break
                     # Same-airport round trip
                     for max_stops, label in [(0, "direct"), (2, "connecting")]:
-                        if searches_done >= MAX_SEARCHES:
+                        if searches_done >= MAX_SEARCHES or time_up():
                             break
                         res = search_flights(
                             o, d,
@@ -502,7 +511,7 @@ def api_search():
                                 per_origin[o]["any"] = f
 
     # Optional open-jaw: different German return airport (only a few top origins to stay fast)
-    if allow_open_jaw and len(origins) > 1 and searches_done < MAX_SEARCHES:
+    if allow_open_jaw and len(origins) > 1 and searches_done < MAX_SEARCHES and not time_up():
         top_origins = origins[:5]
         for outbound in sample_outbounds[:2]:
             for stay in stay_lengths[:2]:
@@ -511,7 +520,7 @@ def api_search():
                     for o_ret in top_origins:
                         if o_out == o_ret:
                             continue
-                        if searches_done >= MAX_SEARCHES:
+                        if searches_done >= MAX_SEARCHES or time_up():
                             break
                         for d in dests[:2]:
                             # multi-city style: out o_out→d, return d→o_ret
@@ -584,6 +593,8 @@ def api_search():
             "sample_outbounds": [d.isoformat() for d in sample_outbounds],
             "currency": currency,
             "searches_performed": searches_done,
+            "stopped_early": searches_done >= MAX_SEARCHES or time_up(),
+            "search_time_budget_seconds": SEARCH_TIME_BUDGET_S,
             "cheapest_direct": directs[0] if directs else None,
             "cheapest_with_stops": connecting[0] if connecting else None,
             "ranked_options": all_results[:15],

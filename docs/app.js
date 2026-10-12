@@ -332,7 +332,7 @@ function renderResults(data) {
     <span><strong>${data.origin_input}</strong> → <strong>${data.destination_input}</strong></span>
     <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
     <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days</span>
-    <span>${data.searches_performed || 0} searches · ${data.all_results_count || 0} options found</span>
+    <span>${data.searches_performed || 0} searches · ${data.all_results_count || 0} options found${data.stopped_early ? " · partial (time limit reached)" : ""}</span>
   `;
 
   const cur = data.currency || window._currency || "";
