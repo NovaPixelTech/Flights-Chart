@@ -647,7 +647,7 @@ function fmtDate(iso) {
 
 function toFlightDict(opt, ctx, airlineNames) {
   const legs = opt.legs.map((l) => ({
-    from: l.from, from_name: l.from_name, to: l.to, to_name: l.to_name,
+    from: l.from, to: l.to,
     departure: _dateTime(l.dep_date, l.dep_time),
     arrival: _dateTime(l.arr_date, l.arr_time),
     duration_min: l.duration_min, plane: l.plane,
