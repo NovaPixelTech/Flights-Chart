@@ -746,6 +746,8 @@ function readStoredRun() {
     if (!raw) return null;
     const data = JSON.parse(raw);
     if (!data || !data.params || !Array.isArray(data.done)) return null;
+    // Prices go stale, so an old checkpoint is not worth resuming.
+    if (!data.saved || Date.now() - data.saved > 7 * 86400000) return null;
     return data;
   } catch (e) { return null; }
 }

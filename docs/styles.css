@@ -348,6 +348,12 @@ details summary::-webkit-details-marker { display: none; }
   color: var(--muted);
   text-align: center;
 }
+.progress .progress-sub {
+  display: inline-block;
+  margin-top: 0.25rem;
+  font-size: 0.76rem;
+  opacity: 0.85;
+}
 
 /* search / stop button row */
 .actions {
