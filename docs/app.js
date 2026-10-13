@@ -287,12 +287,21 @@ function _concurrency() {
   return Math.max(1, Math.min(6, window.SEARCH_CONCURRENCY || 3));
 }
 
-/** Fetch the rendered Google Flights page (HTML) through the reader. */
-async function fetchGoogleFlightsHtml(tfs, currency, timeoutMs = 70000) {
-  const target = "https://www.google.com/travel/flights?tfs=" +
-    encodeURIComponent(tfs) + "&hl=&curr=" + encodeURIComponent(currency);
-  const url = currentReader() + target;
+function googleHosts() {
+  const el = $("googleHosts");
+  if (el && el.value.trim()) {
+    const list = el.value.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (list.length) return list;
+  }
+  const cfg = window.FLIGHT_GOOGLE_HOSTS;
+  if (Array.isArray(cfg) && cfg.length) return cfg.slice();
+  return ["www.google.co.uk", "www.google.ca", "www.google.ie", "www.google.com.hk", "www.google.com"];
+}
 
+// Remember the last host that worked so we don't re-probe blocked ones every time.
+let _preferredHost = 0;
+
+async function _readerGet(url, timeoutMs) {
   const headers = { "x-respond-with": "html" };
   const key = currentReaderKey();
   if (key) headers["Authorization"] = "Bearer " + key;
@@ -301,19 +310,61 @@ async function fetchGoogleFlightsHtml(tfs, currency, timeoutMs = 70000) {
   const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
     const res = await fetch(url, { headers, signal: ctrl && ctrl.signal, redirect: "follow", cache: "no-store" });
-    if (!res.ok) {
-      const err = new Error(
-        res.status === 429
-          ? "The public reader is rate-limiting right now (HTTP 429). Wait a moment and retry, or add a free reader API key in ⚙️ settings."
-          : `Reader returned HTTP ${res.status}.`
-      );
-      err.status = res.status;
-      throw err;
-    }
-    return await res.text();
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Fetch the rendered Google Flights page through the reader.
+ *
+ * Rotates across Google domains: a reader may block one domain (e.g.
+ * "anonymous access to www.google.com blocked") while others still work.
+ * The first host that returns a page containing real flight data wins, and
+ * is remembered for subsequent requests.
+ */
+async function fetchGoogleFlightsHtml(tfs, currency, timeoutMs = 70000) {
+  const hosts = googleHosts();
+  const qs = "tfs=" + encodeURIComponent(tfs) + "&hl=en&curr=" + encodeURIComponent(currency);
+  let lastErr = null;
+
+  for (let attempt = 0; attempt < hosts.length; attempt++) {
+    const idx = (_preferredHost + attempt) % hosts.length;
+    const host = hosts[idx];
+    const url = currentReader() + `https://${host}/travel/flights?${qs}`;
+    try {
+      const { ok, status, text } = await _readerGet(url, timeoutMs);
+      if (ok && text.indexOf('class="ds:1"') !== -1) {
+        _preferredHost = idx; // remember the working host
+        return text;
+      }
+      if (status === 429) {
+        const err = new Error(
+          "The public reader is rate-limiting right now (HTTP 429). Wait a moment and retry, or add a free reader API key in ⚙️ settings."
+        );
+        err.status = 429;
+        throw err; // rotating hosts won't help a rate limit
+      }
+      lastErr = new Error(
+        `Reader returned ${status} for ${host}${ok ? " (page had no flight data)" : ""}.`
+      );
+      if (status) lastErr.status = status;
+    } catch (e) {
+      if (e.status === 429) throw e;
+      lastErr = e;
+    }
+  }
+  // Nothing worked — give the user an actionable hint.
+  const err = new Error(
+    "The reader could not fetch Google Flights from any domain. It may be temporarily " +
+    "rate-limiting or blocking anonymous access. Wait a few minutes and retry, or add a " +
+    "free reader API key in ⚙️ settings." +
+    (lastErr ? `\n\n(Last error: ${lastErr.message})` : "")
+  );
+  err.status = lastErr && lastErr.status;
+  throw err;
 }
 
 async function _withRetry(fn, tries = 3) {
@@ -986,6 +1037,8 @@ function loadSettings() {
   $("readerUrl").value = s.readerUrl || window.FLIGHT_READER || "https://r.jina.ai/";
   $("readerKey").value = s.readerKey || window.FLIGHT_READER_KEY || "";
   $("maxSearches").value = s.maxSearches || window.MAX_SEARCHES || 12;
+  const hosts = s.googleHosts || (window.FLIGHT_GOOGLE_HOSTS || []);
+  $("googleHosts").value = Array.isArray(hosts) ? hosts.join(", ") : String(hosts || "");
 }
 function saveSettings() {
   try {
@@ -993,6 +1046,7 @@ function saveSettings() {
       readerUrl: $("readerUrl").value.trim(),
       readerKey: $("readerKey").value.trim(),
       maxSearches: parseInt($("maxSearches").value, 10) || window.MAX_SEARCHES || 12,
+      googleHosts: $("googleHosts").value.trim(),
     }));
   } catch (e) {}
 }
@@ -1008,7 +1062,7 @@ function wire() {
   bindResolveHint("origin", "originHint");
   bindResolveHint("destination", "destinationHint");
 
-  for (const id of ["readerUrl", "readerKey", "maxSearches"]) {
+  for (const id of ["readerUrl", "readerKey", "maxSearches", "googleHosts"]) {
     $(id).addEventListener("change", saveSettings);
   }
 

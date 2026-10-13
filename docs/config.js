@@ -21,6 +21,17 @@ window.FLIGHT_READER = "https://r.jina.ai/";
 // Optional reader API key (leave blank to stay key-less). Only lifts rate limits.
 window.FLIGHT_READER_KEY = "";
 
+// Google domains to try, in order. The reader may block one domain (for
+// example "anonymous access to www.google.com blocked") while others still
+// work, so the app falls back down this list until it gets real flight data.
+window.FLIGHT_GOOGLE_HOSTS = [
+  "www.google.co.uk",
+  "www.google.ca",
+  "www.google.ie",
+  "www.google.com.hk",
+  "www.google.com",
+];
+
 // Hard cap on how many route/date lookups a single search performs.
 // Each lookup is one reader request, so keep this modest on the free tier.
 window.MAX_SEARCHES = 12;

@@ -81,10 +81,13 @@
           <input id="readerKey" placeholder="leave blank to stay key-less" autocomplete="off" spellcheck="false" />
           <label for="maxSearches">Max route/date lookups per search</label>
           <input id="maxSearches" type="number" min="1" max="40" />
+          <label for="googleHosts">Google domains to try (comma-separated, in order)</label>
+          <input id="googleHosts" placeholder="www.google.co.uk, www.google.ca, www.google.com" autocomplete="off" spellcheck="false" />
           <p class="hint">
             This page is <strong>100% static</strong> — no servers, no accounts, no API keys required.
             It asks a public reader service to render the Google&nbsp;Flights results page, then parses
             the prices right here in your browser. A free key is optional and only lifts rate limits.
+            If the reader blocks one Google domain, the app automatically tries the next one in the list.
             Settings are saved in <em>your</em> browser only.
           </p>
         </div>

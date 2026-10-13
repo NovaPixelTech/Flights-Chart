@@ -34,6 +34,9 @@ Everything runs in `docs/app.js`. It is a self-contained JavaScript port of the
 - **Reader fetch** — asks a public reader service (`https://r.jina.ai/`, free and
   key-less) to fetch and render the Google Flights results page server-side, so CORS and
   Google's JavaScript don't matter. The reader returns the rendered HTML with CORS enabled.
+  The same query works on any Google domain, so if the reader blocks one
+  (e.g. *"anonymous access to www.google.com blocked"*), the app automatically tries the
+  next domain in `FLIGHT_GOOGLE_HOSTS` until it gets real flight data.
 - **Parser** — extracts the flight data (`AF_initDataCallback` / `ds:1` payload) from that
   HTML and maps it to itineraries, prices and airlines. Verified to produce the same results
   as the Python library.
@@ -60,6 +63,7 @@ Your site is live at `https://<user>.github.io/<repo>/`.
 | --- | --- | --- |
 | `FLIGHT_READER` | `https://r.jina.ai/` | The reader/fetcher prefix. |
 | `FLIGHT_READER_KEY` | `""` | Optional reader API key — only **raises rate limits**; never required. |
+| `FLIGHT_GOOGLE_HOSTS` | `["www.google.co.uk", "www.google.ca", …]` | Google domains tried in order until real flight data is returned. |
 | `MAX_SEARCHES` | `12` | Max route/date lookups per search (one reader request each). |
 | `SEARCH_CONCURRENCY` | `3` | How many reader requests run at once. |
 | `SEARCH_TIME_BUDGET_MS` | `90000` | Give up and show partial results after this long. |
@@ -80,8 +84,8 @@ python -m http.server 8000 --directory docs
 
 - **No official Google Flights API exists.** This uses a public reader to render the same
   page a browser would, then parses it. Google may occasionally show a consent/verification
-  page, and the free reader is rate-limited — the app reports both clearly. Retrying usually
-  works.
+  page, and the free reader is rate-limited or may block a given Google domain for a while —
+  the app reports both clearly and falls back to other Google domains. Retrying usually works.
 - **Sampled, not exhaustive.** To respect the free reader, the date window (max 31 days) is
   sampled and the number of lookups is capped (`MAX_SEARCHES`). Country inputs expand to the
   main commercial airports, capped as well.
