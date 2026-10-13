@@ -47,6 +47,13 @@
             <input id="date_to" name="date_to" type="date" />
           </div>
           <div>
+            <label for="date_mode">Date coverage</label>
+            <select id="date_mode" name="date_mode">
+              <option value="every">Every day (most accurate — more lookups)</option>
+              <option value="sampled">Sampled days (faster — may miss some dates)</option>
+            </select>
+          </div>
+          <div>
             <label for="currency">Currency</label>
             <select id="currency" name="currency">
               <option value="EUR">EUR</option>
@@ -80,7 +87,7 @@
           <label for="readerKey">Reader API key (optional — raises rate limits)</label>
           <input id="readerKey" placeholder="leave blank to stay key-less" autocomplete="off" spellcheck="false" />
           <label for="maxSearches">Max route/date lookups per search</label>
-          <input id="maxSearches" type="number" min="1" max="40" />
+          <input id="maxSearches" type="number" min="1" max="120" />
           <label for="googleHosts">Google domains to try (comma-separated, in order)</label>
           <input id="googleHosts" placeholder="www.google.co.uk, www.google.ca, www.google.com" autocomplete="off" spellcheck="false" />
           <p class="hint">

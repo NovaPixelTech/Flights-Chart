@@ -280,7 +280,7 @@ function currentReaderKey() {
 function currentMaxSearches() {
   const typed = parseInt(($("maxSearches") && $("maxSearches").value) || "", 10);
   const val = Number.isFinite(typed) && typed > 0 ? typed : (window.MAX_SEARCHES || 12);
-  return Math.max(1, Math.min(40, val));
+  return Math.max(1, Math.min(120, val));
 }
 
 function _concurrency() {
@@ -445,29 +445,56 @@ function parseFlightsFromHtml(html) {
   } catch (e) { /* metadata is optional */ }
 
   const options = [];
-  const list = payload && payload[3] && payload[3][0];
-  if (!list) return { options, airlineNames, empty: true };
+  const seen = new Set();
 
-  for (const k of list) {
-    try {
-      const flight = k[0];
-      if (!flight || !Array.isArray(flight[2])) continue;
-      const price = (k[1] && k[1][0]) ? k[1][0][1] : null;
-      if (price == null) continue;
-      const airlineCodes = flight[1] || [];
-      const legs = [];
-      for (const sf of flight[2]) {
-        legs.push({
-          from: sf[3], from_name: sf[4], to: sf[6], to_name: sf[5],
-          dep_date: sf[20], dep_time: _parseTime(sf[8]),
-          arr_date: sf[21], arr_time: _parseTime(sf[10]),
-          plane: sf[17], duration_min: sf[11],
-        });
+  // The payload contains MORE THAN ONE list of itineraries. For a round trip
+  // that's typically the nonstop list (payload[2][0]) AND the "best"/connecting
+  // list (payload[3][0]); the cheapest flight is often only in the first.
+  // (fast-flights reads payload[3][0] alone, which is why it can miss it.)
+  const optionLists = [];
+  for (const holder of [payload[2], payload[3]]) {
+    if (!Array.isArray(holder)) continue;
+    for (const cand of holder) {
+      if (Array.isArray(cand) && cand.length && _isOptionEntry(cand[0])) {
+        optionLists.push(cand);
       }
-      if (legs.length) options.push({ price, airline_codes: airlineCodes, legs });
-    } catch (e) { /* skip malformed option */ }
+    }
+  }
+
+  for (const list of optionLists) {
+    for (const k of list) {
+      try {
+        const flight = k[0];
+        if (!flight || !Array.isArray(flight[2])) continue;
+        const price = (k[1] && k[1][0]) ? k[1][0][1] : null;
+        if (price == null) continue;
+        const airlineCodes = flight[1] || [];
+        const legs = [];
+        for (const sf of flight[2]) {
+          legs.push({
+            from: sf[3], from_name: sf[4], to: sf[6], to_name: sf[5],
+            dep_date: sf[20], dep_time: _parseTime(sf[8]),
+            arr_date: sf[21], arr_time: _parseTime(sf[10]),
+            plane: sf[17], duration_min: sf[11],
+          });
+        }
+        if (!legs.length) continue;
+        // de-duplicate: the same itinerary can appear in both lists
+        const sig = price + "|" + legs
+          .map((l) => `${l.from}${l.to}${_dateTime(l.dep_date, l.dep_time)}${_dateTime(l.arr_date, l.arr_time)}`)
+          .join(">");
+        if (seen.has(sig)) continue;
+        seen.add(sig);
+        options.push({ price, airline_codes: airlineCodes, legs });
+      } catch (e) { /* skip malformed option */ }
+    }
   }
   return { options, airlineNames, empty: options.length === 0 };
+}
+
+/** Does this payload entry look like `[flight, [[null, price, ...]], ...]`? */
+function _isOptionEntry(e) {
+  return Array.isArray(e) && Array.isArray(e[0]) && Array.isArray(e[0][2]) && e[0][2].length > 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -674,14 +701,7 @@ async function runSearch(params, onProgress) {
     );
   }
 
-  const span = Math.round((end - start) / MS_DAY);
-  const offsets = [0];
-  if (span > 0) {
-    const steps = Math.min(5, span);
-    for (let i = 1; i <= steps; i++) offsets.push(Math.round((i * span) / steps));
-  }
-  const sampleOutbounds = Array.from(new Set(offsets)).sort((a, b) => a - b)
-    .map((o) => isoLocal(addDays(start, o)));
+  const windowDays = calendarDays; // inclusive number of days in the window
 
   const minDays = Math.max(1, Math.min(30, params.min_days || 7));
   const maxDays = Math.max(minDays, Math.min(30, params.max_days || minDays));
@@ -692,22 +712,39 @@ async function runSearch(params, onProgress) {
   const maxSearches = currentMaxSearches();
 
   // ---- spend the (limited) lookup budget wisely ----
-  // Country inputs expand to many airports, so we divide the budget between
-  // "how many dates to sample" and "how many airport pairs to try" instead of
-  // dumping the whole budget onto the first sampled date.
+  // "every" = check every calendar day in the window (thorough); "sampled" =
+  // spread a handful of days across the window (fast). In sampled mode we
+  // divide the budget between dates, airports and stay lengths instead of
+  // dumping the whole budget onto the first day.
   const pairs = [];
   for (const o of orgs) for (const d of dsts) if (o !== d) pairs.push([o, d]);
 
-  let nDates = Math.min(sampleOutbounds.length, 6);
-  let nPairs = Math.min(pairs.length, (isCountryOrigin || isCountryDest) ? 6 : 3);
-  let nStays = stayLengths.length;
+  const thorough = params.date_mode === "every";
+  let nDates, nPairs, nStays;
 
-  while (nDates * nPairs * nStays > maxSearches && nStays > 1) nStays--;
-  while (nDates * nPairs * nStays > maxSearches) {
-    if (nDates >= nPairs && nDates > 1) nDates--;
-    else if (nPairs > 1) nPairs--;
-    else break;
+  if (thorough) {
+    // Cover the whole window for the primary route, and every stay length.
+    nPairs = 1;
+    nDates = windowDays;
+    nStays = stayLengths.length;
+  } else {
+    nDates = windowDays; // start optimistic; trimmed below to fit the budget
+    nPairs = Math.min(pairs.length, (isCountryOrigin || isCountryDest) ? 6 : 3);
+    nStays = stayLengths.length;
+    while (nDates * nPairs * nStays > maxSearches && nStays > 1) nStays--;
+    while (nDates * nPairs * nStays > maxSearches) {
+      if (nDates >= nPairs && nDates > 1) nDates--;
+      else if (nPairs > 1) nPairs--;
+      else if (nDates > 1) nDates--;
+      else break;
+    }
   }
+
+  // In thorough mode the cap is a floor, not a ceiling: honour the user's
+  // request to cover every day even if it costs more lookups than the default.
+  const budget = thorough
+    ? Math.max(maxSearches, nDates * nPairs * nStays)
+    : maxSearches;
 
   const datesUsed = spreadDates(start, end, nDates);
   const staysUsed = stayLengths.slice(0, Math.max(1, nStays));
@@ -722,13 +759,13 @@ async function runSearch(params, onProgress) {
           kind: "rt", origin: pair[0], dest: pair[1], outbound,
           ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
         });
-        if (tasks.length >= maxSearches) break outer;
+        if (tasks.length >= budget) break outer;
       }
     }
   }
 
   // ---- optional open-jaw tasks (different return airport) ----
-  if (params.open_jaw && orgs.length > 1 && tasks.length < maxSearches) {
+  if (params.open_jaw && orgs.length > 1 && tasks.length < budget) {
     const top = orgs.slice(0, 5);
     const ob = datesUsed[0];
     const stay = staysUsed[0];
@@ -740,7 +777,7 @@ async function runSearch(params, onProgress) {
         for (const d of dsts.slice(0, 2)) {
           if (oOut === d || oRet === d) continue;
           tasks.push({ kind: "oj", o_out: oOut, o_ret: oRet, dest: d, outbound: ob, ret, stay });
-          if (tasks.length >= maxSearches + 3) break outer2;
+          if (tasks.length >= budget + 3) break outer2;
         }
       }
     }
@@ -752,6 +789,13 @@ async function runSearch(params, onProgress) {
   for (const o of orgs) perOrigin[o] = { direct: null, connecting: null, any: null };
 
   const startedAt = Date.now();
+  // Allow more time when there are many lookups (thorough mode), so a big
+  // search isn't cut off early. Roughly 5s per lookup at the chosen
+  // concurrency, with the configured budget as a minimum.
+  const timeBudgetMs = Math.max(
+    window.SEARCH_TIME_BUDGET_MS || 90000,
+    Math.ceil(tasks.length / _concurrency()) * 5000
+  );
   let done = 0;
   let errors = 0;
   let lastError = null;
@@ -773,7 +817,7 @@ async function runSearch(params, onProgress) {
 
   async function worker() {
     while (queue.length) {
-      if (Date.now() - startedAt > (window.SEARCH_TIME_BUDGET_MS || 90000)) { stopped = true; return; }
+      if (Date.now() - startedAt > timeBudgetMs) { stopped = true; return; }
       const task = queue.shift();
       try {
         const found = task.kind === "oj"
@@ -849,9 +893,10 @@ async function runSearch(params, onProgress) {
     all_results_count: all.length,
     note:
       "Live Google Flights prices, fetched and parsed entirely in your browser — no backend, no API key. " +
-      "Country inputs expand to that country's commercial airports. The date window is capped at 31 days and " +
-      "sampled (not every single day) — see the date breakdown — and the number of lookups is capped (⚙️ settings) " +
-      "to respect the free reader, so the budget is split between dates and airports. " +
+      "All of Google's itinerary lists (nonstop and connecting) are parsed, so the cheapest option is included. " +
+      "Country inputs expand to that country's commercial airports. The date window is capped at 31 days: " +
+      "use \"Every day in window\" for full coverage, or \"Sampled days\" to spread a few days across it " +
+      "(see the date breakdown). Lookups are capped (⚙️ settings) to respect the free reader. " +
       "Round-trip prices are Google's own totals; the itinerary shown is the outbound (Google pairs the return automatically). " +
       "Open-jaw totals are estimated from two separate one-ways.",
   };
@@ -1084,6 +1129,7 @@ function wire() {
       max_days: parseInt($("max_days").value, 10) || 7,
       date_from: $("date_from").value || null,
       date_to: $("date_to").value || null,
+      date_mode: $("date_mode") ? $("date_mode").value : "sampled",
       currency: $("currency").value,
       open_jaw: $("open_jaw").value === "true",
     };

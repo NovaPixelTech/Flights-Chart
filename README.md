@@ -38,8 +38,11 @@ Everything runs in `docs/app.js`. It is a self-contained JavaScript port of the
   (e.g. *"anonymous access to www.google.com blocked"*), the app automatically tries the
   next domain in `FLIGHT_GOOGLE_HOSTS` until it gets real flight data.
 - **Parser** — extracts the flight data (`AF_initDataCallback` / `ds:1` payload) from that
-  HTML and maps it to itineraries, prices and airlines. Verified to produce the same results
-  as the Python library.
+  HTML and maps it to itineraries, prices and airlines. It reads **every** itinerary list in
+  the payload (the nonstop list *and* the connecting/"best" list), because the cheapest flight
+  is frequently only in one of them (the `fast-flights` library reads just one, so it can miss
+  the cheapest). Verified to produce the same results as the Python library, plus the cheaper
+  options it misses.
 
 > **No secret is embedded and nothing is exposed.** The reader request and the (already
 > public) Google Flights page are the only network calls.
@@ -86,9 +89,11 @@ python -m http.server 8000 --directory docs
   page a browser would, then parses it. Google may occasionally show a consent/verification
   page, and the free reader is rate-limited or may block a given Google domain for a while —
   the app reports both clearly and falls back to other Google domains. Retrying usually works.
-- **Sampled, not exhaustive.** To respect the free reader, the date window (max 31 days) is
-  sampled and the number of lookups is capped (`MAX_SEARCHES`). Country inputs expand to the
-  main commercial airports, capped as well.
+- **Sampled, not exhaustive (unless you ask).** To respect the free reader, the date window
+  (max 31 days) is normally sampled and the number of lookups is capped (`MAX_SEARCHES`).
+  Choose **"Every day in window"** to check each calendar day for the primary route instead
+  (more requests — raise the lookup cap accordingly). Country inputs expand to the main
+  commercial airports, capped as well.
 - **Round-trip detail.** Google returns its own round-trip totals; the itinerary shown is the
   outbound leg (Google pairs the return automatically). Open-jaw totals are estimated from two
   separate one-ways.
