@@ -1045,8 +1045,11 @@ async function runSearch(params, onProgress) {
 
   const startedAt = Date.now();
   const returnLimit = (() => {
-    const n = Number(window.RETURN_FETCH_LIMIT);
-    return Number.isFinite(n) && n > 0 ? Math.min(80, n) : 16;
+    const base = Number(window.RETURN_FETCH_LIMIT);
+    const min = Number.isFinite(base) && base > 0 ? Math.min(80, base) : 16;
+    // Scale with the lookup ceiling so raising it in ⚙️ really does load more
+    // return details, but never spend more than a quarter of the budget here.
+    return Math.max(min, Math.ceil(lookupCeiling * 0.2));
   })();
   // Every lookup and every return fetch is one reader request, and the reader
   // allows ~_readerRate() of them a minute, so the wall-clock cost is the

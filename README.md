@@ -80,7 +80,7 @@ Your site is live at `https://<user>.github.io/<repo>/`.
 | `FLIGHT_GOOGLE_HOSTS` | `["www.google.co.uk", "www.google.ca", …]` | Google domains tried in order until real flight data is returned. |
 | `MAX_SEARCHES` | `80` | Lookup ceiling per search (each lookup = one reader request). It is treated as a **floor** when more airport pairs still need covering, so a country search never silently drops airports, and as the budget for the deeper date sweep. Hard cap: 400. |
 | `READER_MAX_PER_MINUTE` | `18` | How many reader lookups may be admitted per rolling minute. The key-less reader starts answering `HTTP 429` somewhere above 20, so requests are queued under this rate instead of being sent and failing. |
-| `RETURN_FETCH_LIMIT` | `16` | How many return-direction lookups to spend on the displayed flights (they share the same per-minute quota as the date sweep). |
+| `RETURN_FETCH_LIMIT` | `16` | Minimum number of return-direction lookups spent on the displayed flights. It grows with `MAX_SEARCHES` (up to a quarter of it), since return lookups share the same per-minute quota as the date sweep. |
 | `SEARCH_CONCURRENCY` | `3` | How many reader requests may be in flight at once (the rate limiter still paces them). |
 | `SEARCH_TIME_BUDGET_MS` | `900000` | Hard stop: show partial results after this long. |
 

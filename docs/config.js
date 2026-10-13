@@ -51,8 +51,9 @@ window.SEARCH_CONCURRENCY = 3;
 // limit; see the ⚙️ settings panel.
 window.READER_MAX_PER_MINUTE = 18;
 
-// How many return-direction lookups to fetch for the displayed flights. Each
-// one is a reader request, so this competes with the date sweep for quota.
+// Minimum number of return-direction lookups for the displayed flights. This
+// grows with the lookup ceiling (up to a quarter of it), because each return
+// lookup is a reader request that competes with the date sweep for quota.
 window.RETURN_FETCH_LIMIT = 16;
 
 // Hard stop for a search (partial results are returned instead).
