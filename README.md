@@ -2,10 +2,11 @@
 
 Web app that finds the **cheapest direct flight** and the **cheapest flight with at most
 2 stops** (stopover ≤ 3 hours) between two cities/airports for a vacation of a given length.
-Supports country inputs (expands to that country's commercial airports), flexible date
-windows, stay-length ranges, open-jaw (different return airport), and an optional
-**direct-only (nonstop)** filter. Every result lists the **outbound and the return** flight
-(airport, `dd.mm.yyyy` date, times, airline) plus the number of stay days.
+Supports country inputs (expands to **every** commercial airport in that country — all of them
+are searched), explicit airport lists (`DUS, FRA, HAM`), flexible date windows, stay-length
+ranges, open-jaw (different return airport), and an optional **direct-only (nonstop)** filter.
+Every result lists the **outbound and the return** flight (airport, `dd.mm.yyyy` date, times,
+airline) plus the number of stay days.
 
 **Live flight prices. Completely static. No backend, no accounts, no API keys, no credit card.**
 It runs entirely in the browser on GitHub Pages.
@@ -52,6 +53,8 @@ Everything runs in `docs/app.js`. It is a self-contained JavaScript port of the
 ## Use it
 
 Open the GitHub Pages URL, type a country/city/airport, pick your dates and stay, and search.
+You can also list several airports or cities directly, separated by commas or spaces —
+e.g. `DUS, FRA, HAM` (or `DUS FRA HAM`) — and every listed airport is searched.
 
 ## Publish on GitHub Pages
 
@@ -69,7 +72,7 @@ Your site is live at `https://<user>.github.io/<repo>/`.
 | `FLIGHT_READER` | `https://r.jina.ai/` | The reader/fetcher prefix. |
 | `FLIGHT_READER_KEY` | `""` | Optional reader API key — only **raises rate limits**; never required. |
 | `FLIGHT_GOOGLE_HOSTS` | `["www.google.co.uk", "www.google.ca", …]` | Google domains tried in order until real flight data is returned. |
-| `MAX_SEARCHES` | `12` | Max route/date lookups per search (a round trip uses one lookup for the outbound plus one for the return, de-duplicated). |
+| `MAX_SEARCHES` | `12` | Lookup budget per search. It sets how many calendar days are checked; it is treated as a **floor** when more airport pairs still need covering, so a country search never silently drops airports (hard ceiling: 120 lookups). Each round trip uses one lookup for the outbound plus one for the return, de-duplicated. |
 | `SEARCH_CONCURRENCY` | `3` | How many reader requests run at once. |
 | `SEARCH_TIME_BUDGET_MS` | `90000` | Give up and show partial results after this long. |
 
@@ -91,11 +94,20 @@ python -m http.server 8000 --directory docs
   page a browser would, then parses it. Google may occasionally show a consent/verification
   page, and the free reader is rate-limited or may block a given Google domain for a while —
   the app reports both clearly and falls back to other Google domains. Retrying usually works.
-- **Sampled, not exhaustive (unless you ask).** To respect the free reader, the date window
-  (max 31 days) is normally sampled and the number of lookups is capped (`MAX_SEARCHES`).
-  Choose **"Every day in window"** to check each calendar day for the primary route instead
-  (more requests — raise the lookup cap accordingly). Country inputs expand to the main
-  commercial airports, capped as well.
+- **Complete airport coverage.** Every airport the input resolves to is searched — a country
+  expands to all of its commercial airports (e.g. Germany → 30 airports) and **every**
+  origin→destination pair is looked up, so the real cheapest departure airport is found even
+  when it isn't the country's main hub. Multiple airports/cities can also be listed directly
+  (`DUS, FRA, HAM`, `DUS FRA HAM`, `Frankfurt, Munich`). Cities that have several hubs (London,
+  Paris, New York, …) expand to all of them.
+- **Sampled dates, honest reporting.** Because the free reader is rate-limited, the lookup
+  budget is spread in priority order: (1) every airport pair, (2) every stay length you asked
+  for, (3) calendar days. **"Every day in window"** covers all of a 31-day window whenever the
+  whole grid is affordable (single routes and small multi-airport searches, up to 120 lookups);
+  bigger country searches degrade gracefully. The result header always states exactly what was
+  covered (`Coverage: N/M airport pairs · N/M dates · N/M stay lengths`), the per-airport table
+  marks airports that weren't checked, and raising the lookup budget in ⚙️ settings buys more
+  date coverage.
 - **Round-trip detail.** Google's round-trip page returns its round-trip total price but lists
   only the **outbound** itinerary. The app therefore fetches the **return direction separately**
   (one extra lookup per return date, de-duplicated) and shows the cheapest return on that date
@@ -107,8 +119,9 @@ python -m http.server 8000 --directory docs
 - **Direct-only.** Tick *Direct flights only (nonstop)* to restrict every lookup (outbound and
   return) to nonstop itineraries.
 - Prices are live estimates only — not bookable through this app.
-- City resolution works best for major cities; prefer IATA codes (JFK, LHR, CDG, …) for
-  reliability.
+- City resolution works for major cities (and expands to all of a city's hubs, e.g. London →
+  LHR/LGW/STN/LCY); you can also list airports directly (`DUS, FRA, HAM`). An exact IATA code
+  always resolves to that single airport.
 
 ## Optional: self-hosted Python backend (legacy)
 

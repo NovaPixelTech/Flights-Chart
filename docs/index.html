@@ -21,13 +21,13 @@
       <form id="searchForm">
         <div class="form-grid">
           <div>
-            <label for="origin">From (country, city or airport)</label>
-            <input id="origin" name="origin" placeholder="e.g. Germany or BER" required autocomplete="off" />
+            <label for="origin">From (country, city or airport — lists allowed)</label>
+            <input id="origin" name="origin" placeholder="e.g. Germany, BER, or DUS, FRA, HAM" required autocomplete="off" />
             <div class="resolve-hint" id="originHint"></div>
           </div>
           <div>
-            <label for="destination">To (country, city or airport)</label>
-            <input id="destination" name="destination" placeholder="e.g. Athens or Greece" required autocomplete="off" />
+            <label for="destination">To (country, city or airport — lists allowed)</label>
+            <input id="destination" name="destination" placeholder="e.g. Athens, Greece, or ATH, SKG" required autocomplete="off" />
             <div class="resolve-hint" id="destinationHint"></div>
           </div>
           <div>
@@ -92,7 +92,7 @@
           <input id="readerUrl" placeholder="https://r.jina.ai/" autocomplete="off" spellcheck="false" />
           <label for="readerKey">Reader API key (optional — raises rate limits)</label>
           <input id="readerKey" placeholder="leave blank to stay key-less" autocomplete="off" spellcheck="false" />
-          <label for="maxSearches">Max route/date lookups per search</label>
+          <label for="maxSearches">Lookup budget per search (more = more dates checked; every airport pair is always attempted)</label>
           <input id="maxSearches" type="number" min="1" max="120" />
           <label for="googleHosts">Google domains to try (comma-separated, in order)</label>
           <input id="googleHosts" placeholder="www.google.co.uk, www.google.ca, www.google.com" autocomplete="off" spellcheck="false" />

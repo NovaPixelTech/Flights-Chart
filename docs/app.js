@@ -150,7 +150,8 @@ function buildIndex(data) {
 }
 
 /* Resolve user input (city / country / airport) to one or more IATA codes. */
-function resolveLocations(text) {
+/** Resolve a single entry (IATA code, city, or country) to airport codes. */
+function resolveOneLocation(text) {
   if (!text) return [];
   text = text.trim();
   const upper = text.toUpperCase();
@@ -170,13 +171,54 @@ function resolveLocations(text) {
     return [codes[0]];
   }
   for (const city in CITY_TO_IATA) {
-    if (lower.includes(city) || city.includes(lower)) return [CITY_TO_IATA[city][0]];
+    // Loose substring match, but only for reasonably long inputs — otherwise
+    // short codes like "FRA" would match unrelated cities ("san FRAncisco").
+    if (lower.length >= 4 && (lower.includes(city) || city.includes(lower))) return [CITY_TO_IATA[city][0]];
   }
   for (const code in AIRPORTS) {
     const name = (AIRPORTS[code].name || "").toLowerCase();
     if (lower && name.includes(lower)) return [code];
   }
   return [];
+}
+
+/** Is this input an explicit list rather than one country/city/airport? */
+function isExplicitList(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (/[,;/+]/.test(raw)) return true;
+  // A run of 3-letter IATA codes separated by spaces: "DUS FRA HAM".
+  const words = raw.split(/\s+/).filter(Boolean);
+  return words.length > 1 &&
+    words.every((w) => /^[A-Za-z]{3}$/.test(w) && AIRPORTS[w.toUpperCase()]);
+}
+
+/**
+ * Resolve the origin/destination field. Accepts one country, city or airport —
+ * or an explicit list of them, e.g. "DUS, FRA, HAM" / "DUS FRA HAM" /
+ * "Frankfurt, Munich, Berlin". Lists are resolved to the union of their codes.
+ */
+function resolveLocations(text) {
+  if (!text) return [];
+  const raw = String(text).trim();
+  if (!raw) return [];
+
+  let parts = raw.split(/[,;/+]+/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length < 2) {
+    const words = raw.split(/\s+/).filter(Boolean);
+    if (words.length > 1 &&
+        words.every((w) => /^[A-Za-z]{3}$/.test(w) && AIRPORTS[w.toUpperCase()])) {
+      parts = words;
+    }
+  }
+  if (parts.length > 1) {
+    const out = [];
+    for (const part of parts) {
+      for (const code of resolveOneLocation(part)) if (out.indexOf(code) === -1) out.push(code);
+    }
+    return out;
+  }
+  return resolveOneLocation(raw);
 }
 
 function airportInfo(code) {
@@ -754,8 +796,12 @@ async function runSearch(params, onProgress) {
 
   const isCountryOrigin = !!COUNTRY_AIRPORTS[params.origin.trim().toLowerCase()];
   const isCountryDest = !!COUNTRY_AIRPORTS[params.destination.trim().toLowerCase()];
-  const orgs = origins.slice(0, isCountryOrigin ? 30 : 6);
-  const dsts = dests.slice(0, isCountryDest ? 15 : 4);
+  // An explicit list ("DUS, FRA, HAM") is honoured in full; a country expands
+  // to a capped set so an "all airports × all airports" search stays sane.
+  const originExplicit = isExplicitList(params.origin);
+  const destExplicit = isExplicitList(params.destination);
+  const orgs = origins.slice(0, originExplicit ? 20 : (isCountryOrigin ? 30 : 6));
+  const dsts = dests.slice(0, destExplicit ? 20 : (isCountryDest ? 8 : 4));
 
   // ---- date window (max 31 calendar days) ----
   const dFrom = parseISODate(params.date_from) || addDays(new Date(), 30);
@@ -782,65 +828,75 @@ async function runSearch(params, onProgress) {
   const maxSearches = currentMaxSearches();
 
   // ---- spend the (limited) lookup budget wisely ----
-  // "every" = check every calendar day in the window (thorough); "sampled" =
-  // spread a handful of days across the window (fast). In sampled mode we
-  // divide the budget between dates, airports and stay lengths instead of
-  // dumping the whole budget onto the first day.
+  // Coverage priorities: (1) every origin→destination airport pair,
+  // (2) every stay length the user asked for, (3) every calendar day in the
+  // window. The budget is finite, so the lowest priority is reduced first.
+  // Crucially, airports are only skipped if the budget cannot cover the pairs
+  // even once — and the results always report exactly what was covered.
   const pairs = [];
   for (const o of orgs) for (const d of dsts) if (o !== d) pairs.push([o, d]);
+  if (!pairs.length) pairs.push([orgs[0], dsts[0]]); // same airport in and out
 
   const thorough = params.date_mode === "every";
-  let nDates, nPairs, nStays;
 
-  if (thorough) {
-    // Cover the whole window for the primary route, and every stay length.
-    nPairs = 1;
-    nDates = windowDays;
-    nStays = stayLengths.length;
-  } else {
-    nDates = windowDays; // start optimistic; trimmed below to fit the budget
-    nPairs = Math.min(pairs.length, (isCountryOrigin || isCountryDest) ? 6 : 3);
-    nStays = stayLengths.length;
-    while (nDates * nPairs * nStays > maxSearches && nStays > 1) nStays--;
-    while (nDates * nPairs * nStays > maxSearches) {
-      if (nDates >= nPairs && nDates > 1) nDates--;
-      else if (nPairs > 1) nPairs--;
-      else if (nDates > 1) nDates--;
-      else break;
-    }
+  // Hard ceiling so "all airports of country A → all of country B" cannot
+  // explode into thousands of requests (~2 fetches per task: outbound+return).
+  const TASK_CEILING = 120;
+
+  let nPairs = pairs.length;
+  let nStays = stayLengths.length;
+  let floorTasks = nPairs * nStays; // one date per pair × every stay length
+  if (floorTasks > TASK_CEILING) {
+    nPairs = Math.max(1, Math.floor(TASK_CEILING / nStays));
+    floorTasks = nPairs * nStays;
   }
 
-  // In thorough mode the cap is a floor, not a ceiling: honour the user's
-  // request to cover every day even if it costs more lookups than the default.
-  const budget = thorough
-    ? Math.max(maxSearches, nDates * nPairs * nStays)
-    : maxSearches;
+  // "Every day" covers the entire window whenever the whole grid is affordable
+  // (single routes and small multi-airport searches). Otherwise the lookup
+  // budget is spread in priority order: every airport pair × every stay length
+  // first, then as many calendar days as the budget allows. The configured cap
+  // is treated as a *floor* when more airports still need covering, so no
+  // airport is ever silently dropped.
+  let nDates, budget;
+  const fullGrid = nPairs * nStays * windowDays;
+  if (thorough && fullGrid <= TASK_CEILING) {
+    budget = fullGrid; // full window coverage is affordable
+  } else {
+    const wanted = thorough ? floorTasks * 2 : floorTasks;
+    budget = Math.min(TASK_CEILING, Math.max(maxSearches, wanted));
+  }
+  nDates = Math.min(windowDays, Math.max(1, Math.floor(budget / floorTasks)));
 
   const datesUsed = spreadDates(start, end, nDates);
   const staysUsed = stayLengths.slice(0, Math.max(1, nStays));
+  const totalTasks = Math.max(1, nPairs * datesUsed.length * staysUsed.length);
 
   // ---- build the task list: airport pair → date → stay ----
   const tasks = [];
-  outer:
+  const searchedOrigins = new Set();
+  taskLoop:
   for (const pair of pairs.slice(0, nPairs)) {
     for (const outbound of datesUsed) {
       for (const stay of staysUsed) {
+        if (tasks.length >= totalTasks) break taskLoop;
         tasks.push({
           kind: "rt", origin: pair[0], dest: pair[1], outbound,
           ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
           maxStops: params.direct_only ? 0 : 2,
         });
-        if (tasks.length >= budget) break outer;
+        searchedOrigins.add(pair[0]);
       }
     }
   }
 
   // ---- optional open-jaw tasks (different return airport) ----
-  if (params.open_jaw && orgs.length > 1 && tasks.length < budget) {
+  // Kept outside the coverage grid so "every day" mode doesn't swallow them.
+  if (params.open_jaw && orgs.length > 1) {
     const top = orgs.slice(0, 5);
     const ob = datesUsed[0];
     const stay = staysUsed[0];
     const ret = isoLocal(addDays(parseISODate(ob), stay));
+    let added = 0;
     outer2:
     for (const oOut of top) {
       for (const oRet of top) {
@@ -849,7 +905,8 @@ async function runSearch(params, onProgress) {
           if (oOut === d || oRet === d) continue;
           tasks.push({ kind: "oj", o_out: oOut, o_ret: oRet, dest: d, outbound: ob, ret, stay,
             maxStops: params.direct_only ? 0 : 1 });
-          if (tasks.length >= budget + 3) break outer2;
+          searchedOrigins.add(oOut);
+          if (++added >= 6) break outer2;
         }
       }
     }
@@ -938,6 +995,7 @@ async function runSearch(params, onProgress) {
     cheapest_direct: perOrigin[o].direct,
     cheapest_connecting: perOrigin[o].connecting,
     has_flights: perOrigin[o].any != null,
+    searched: searchedOrigins.has(o),
   })).sort((x, y) => {
     const px = x.cheapest_any && x.cheapest_any.price != null ? x.cheapest_any.price : 1e9;
     const py = y.cheapest_any && y.cheapest_any.price != null ? y.cheapest_any.price : 1e9;
@@ -958,19 +1016,28 @@ async function runSearch(params, onProgress) {
     direct_only: !!params.direct_only,
     searches_performed: done,
     lookup_errors: errors,
-    stopped_early: stopped || done >= maxSearches,
+    stopped_early: stopped || done < tasks.length,
+    // Exactly what this search covered — so partial coverage is never silent.
+    pairs_available: pairs.length,
+    pairs_searched: nPairs,
+    dates_checked: datesUsed.length,
+    dates_in_window: windowDays,
+    stays_checked: staysUsed.length,
+    stays_requested: stayLengths.length,
     cheapest_direct: directs[0] || null,
     cheapest_with_stops: connecting[0] || null,
-    ranked_options: all.slice(0, 15),
+    ranked_options: all.slice(0, 50),
     per_date_summary: perDateList,
     per_origin_summary: perOriginList,
     all_results_count: all.length,
     note:
       "Live Google Flights prices, fetched and parsed entirely in your browser — no backend, no API key. " +
       "All of Google's itinerary lists (nonstop and connecting) are parsed, so the cheapest option is included. " +
-      "Country inputs expand to that country's commercial airports. The date window is capped at 31 days: " +
-      "use \"Every day in window\" for full coverage, or \"Sampled days\" to spread a few days across it " +
-      "(see the date breakdown). Lookups are capped (⚙️ settings) to respect the free reader. " +
+      "Country inputs expand to that country's commercial airports, and every resolved airport pair is searched; " +
+      "you can also list airports directly (e.g. \"DUS, FRA, HAM\"). The date window is capped at 31 days: " +
+      "use \"Every day in window\" for full date coverage on a single route, or \"Sampled days\" to spread a few " +
+      "days across it (the results always state how many pairs/dates/stays were covered). Lookups are capped " +
+      "(⚙️ settings); the cap is treated as a floor when more airports still need covering. " +
       "Round-trip prices are Google's own totals; Google's round-trip page lists only the outbound itinerary, " +
       "so the return flight shown is the cheapest return on that date (same airline when available), fetched separately. " +
       (params.direct_only ? "Only nonstop itineraries were requested. " : "") +
@@ -1086,6 +1153,7 @@ function renderResults(data) {
     <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days</span>
     ${data.direct_only ? `<span>Direct (nonstop) only</span>` : ""}
     <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? " · partial (limit reached)" : ""}</span>
+    ${data.pairs_available ? `<span>Coverage: <strong>${data.pairs_searched}/${data.pairs_available}</strong> airport pairs · <strong>${data.dates_checked}/${data.dates_in_window}</strong> dates · <strong>${data.stays_checked}/${data.stays_requested}</strong> stay lengths</span>` : ""}
   `;
 
   const cur = data.currency || window._currency || "";
@@ -1095,7 +1163,9 @@ function renderResults(data) {
 
   const ranked = data.ranked_options || [];
   if (ranked.length) {
-    html += `<div class="section-title">All cheapest options (sorted by price)</div>`;
+    const shown = ranked.length;
+    const total = data.all_results_count || shown;
+    html += `<div class="section-title">All cheapest options, sorted by price${total > shown ? ` (showing top ${shown} of ${total})` : ` (${shown} found)`}</div>`;
     html += `<div class="results-table-wrap"><table class="results-table"><thead><tr>
       <th>#</th><th>Price</th><th>Outbound flight</th><th>Return flight</th><th>Stay</th><th>Type</th>
     </tr></thead><tbody>`;
@@ -1151,11 +1221,19 @@ function renderResults(data) {
           <td>${best.stay_days != null ? best.stay_days + "d" : "—"}</td>
           <td>Verified</td>
         </tr>`;
+      } else if (row.searched) {
+        html += `<tr>
+          <td><strong>${a.code || "—"}</strong></td>
+          <td>${a.city || a.name || "—"}</td>
+          <td colspan="4">—</td>
+          <td>No flights</td>
+        </tr>`;
       } else {
         html += `<tr style="opacity:0.55">
           <td><strong>${a.code || "—"}</strong></td>
           <td>${a.city || a.name || "—"}</td>
-          <td colspan="5">—</td>
+          <td colspan="4">—</td>
+          <td>Not checked</td>
         </tr>`;
       }
     });
