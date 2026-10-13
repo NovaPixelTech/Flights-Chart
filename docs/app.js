@@ -508,7 +508,7 @@ function _dateObj(d) {
 }
 function _dateTime(d, t) {
   const ds = _dateObj(d);
-  return ds ? `${ds} ${_pad2(t[0])}:${_pad2(t[1])}` : "—";
+  return ds ? `${fmtDate(ds)} ${_pad2(t[0])}:${_pad2(t[1])}` : "—";
 }
 function _dtMs(d, t) {
   const ds = _dateObj(d);
@@ -532,7 +532,12 @@ function formatDuration(min) {
   const m = min % 60;
   return h + "h " + m + "m";
 }
-function fmtDate(iso) { return (iso || "").slice(0, 10); }
+/** ISO date (YYYY-MM-DD / YYYY-MM-DD HH:MM) → DD.MM.YYYY. */
+function fmtDate(iso) {
+  const s = String(iso || "").slice(0, 10);
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : s;
+}
 
 function toFlightDict(opt, ctx, airlineNames) {
   const legs = opt.legs.map((l) => ({
@@ -594,17 +599,69 @@ function spreadDates(start, end, count) {
 /* ------------------------------------------------------------------ *
  *  Search orchestration
  * ------------------------------------------------------------------ */
+
+/* One-way lookups are cached by route+date+stops so return fetches that
+ * repeat (different outbound dates often share a return date) cost nothing. */
+const _oneWayCache = new Map();
+
+async function fetchOneWayOptions(from, to, date, maxStops, currency) {
+  const key = [from, to, date, maxStops, currency].join("|");
+  if (_oneWayCache.has(key)) return _oneWayCache.get(key);
+  const p = (async () => {
+    const tfs = buildTfs({
+      legs: [{ date, from, to, maxStops, maxLayover: 180 }],
+      trip: "one-way", currency,
+    });
+    const html = await _withRetry(() => fetchGoogleFlightsHtml(tfs, currency));
+    const parsed = parseFlightsFromHtml(html);
+    return parsed.options.map((o) => toFlightDict(o, {
+      origin: from, dest: to, returnAirport: from,
+      outbound: date, ret: null, stay: null, openJaw: false,
+    }, parsed.airlineNames));
+  })().catch(() => []); // return details are best-effort — never fail the task
+  _oneWayCache.set(key, p);
+  return p;
+}
+
+/** Attach the best-matching return itinerary (same airline, else cheapest). */
+function attachReturnLeg(f, returnOptions, maxStops) {
+  if (!returnOptions || !returnOptions.length) return;
+  const pool = returnOptions.filter((r) =>
+    r.price != null &&
+    !(maxStops === 0 && r.stops > 0) &&
+    !(r.stops > 0 && r.layovers_min.some((l) => l > 180)));
+  if (!pool.length) return;
+  const airlines = new Set(f.airlines || []);
+  const sameAirline = pool.filter((r) => (r.airlines || []).some((a) => airlines.has(a)));
+  const pick = (sameAirline.length ? sameAirline : pool)
+    .slice().sort((a, b) => a.price - b.price)[0];
+  f.return_legs = pick.legs;
+  f.return_airlines = pick.airlines;
+  f.return_stops = pick.stops;
+  f.return_duration_min = pick.total_duration_min;
+  f.return_layovers_min = pick.layovers_min;
+}
+
 async function searchOneRoute(task, currency) {
+  const maxStops = task.maxStops != null ? task.maxStops : 2;
   const legs = [{
-    date: task.outbound, from: task.origin, to: task.dest, maxStops: 2, maxLayover: 180,
+    date: task.outbound, from: task.origin, to: task.dest, maxStops, maxLayover: 180,
   }];
   let trip = "one-way";
+  let returnPromise = null;
   if (task.ret) {
-    legs.push({ date: task.ret, from: task.dest, to: task.origin, maxStops: 2, maxLayover: 180 });
+    legs.push({ date: task.ret, from: task.dest, to: task.origin, maxStops, maxLayover: 180 });
     trip = "round-trip";
+    // Google's round-trip response lists only the OUTBOUND itinerary (the price
+    // is the round-trip total), so fetch the return direction separately in
+    // order to show the return flight's airport, date, times and airline.
+    returnPromise = fetchOneWayOptions(task.dest, task.origin, task.ret, maxStops, currency);
   }
   const tfs = buildTfs({ legs, trip, currency });
-  const html = await _withRetry(() => fetchGoogleFlightsHtml(tfs, currency));
+  const [html, returnOptions] = await Promise.all([
+    _withRetry(() => fetchGoogleFlightsHtml(tfs, currency)),
+    returnPromise || Promise.resolve(null),
+  ]);
   const { options, airlineNames } = parseFlightsFromHtml(html);
 
   const out = [];
@@ -613,7 +670,9 @@ async function searchOneRoute(task, currency) {
       origin: task.origin, dest: task.dest, returnAirport: task.origin,
       outbound: task.outbound, ret: task.ret, stay: task.stay, openJaw: false,
     }, airlineNames);
+    if (maxStops === 0 && d.stops > 0) continue;
     if (d.stops > 0 && d.layovers_min.some((l) => l > 180)) continue;
+    if (returnOptions) attachReturnLeg(d, returnOptions, maxStops);
     out.push(d);
   }
   return out;
@@ -621,12 +680,13 @@ async function searchOneRoute(task, currency) {
 
 /** Open-jaw: cheapest outbound one-way + cheapest return one-way, summed. */
 async function searchOpenJaw(task, currency) {
+  const maxStops = task.maxStops != null ? task.maxStops : 1;
   const outTfs = buildTfs({
-    legs: [{ date: task.outbound, from: task.o_out, to: task.dest, maxStops: 1, maxLayover: 180 }],
+    legs: [{ date: task.outbound, from: task.o_out, to: task.dest, maxStops, maxLayover: 180 }],
     trip: "one-way", currency,
   });
   const retTfs = buildTfs({
-    legs: [{ date: task.ret, from: task.dest, to: task.o_ret, maxStops: 1, maxLayover: 180 }],
+    legs: [{ date: task.ret, from: task.dest, to: task.o_ret, maxStops, maxLayover: 180 }],
     trip: "one-way", currency,
   });
   const [outHtml, retHtml] = await _withRetry(() =>
@@ -635,35 +695,44 @@ async function searchOpenJaw(task, currency) {
   const outP = parseFlightsFromHtml(outHtml);
   const retP = parseFlightsFromHtml(retHtml);
 
+  const usable = (d) => !(maxStops === 0 && d.stops > 0) &&
+    !(d.stops > 0 && d.layovers_min.some((l) => l > 180)) && d.price != null;
+
   const bestOut = outP.options
     .map((o) => toFlightDict(o, {
       origin: task.o_out, dest: task.dest, returnAirport: task.o_out,
       outbound: task.outbound, ret: task.ret, stay: task.stay, openJaw: true,
     }, outP.airlineNames))
-    .sort((a, b) => (a.price ?? 1e9) - (b.price ?? 1e9))[0];
+    .filter(usable)
+    .sort((a, b) => a.price - b.price)[0];
   const bestRet = retP.options
     .map((o) => toFlightDict(o, {
       origin: task.dest, dest: task.o_ret, returnAirport: task.dest,
       outbound: task.ret, ret: null, stay: null, openJaw: true,
     }, retP.airlineNames))
-    .sort((a, b) => (a.price ?? 1e9) - (b.price ?? 1e9))[0];
+    .filter(usable)
+    .sort((a, b) => a.price - b.price)[0];
 
-  if (!bestOut || !bestRet || bestOut.price == null || bestRet.price == null) return [];
+  if (!bestOut || !bestRet) return [];
 
-  const airlines = Array.from(new Set([...(bestOut.airlines || []), ...(bestRet.airlines || [])]));
   return [{
     price: bestOut.price + bestRet.price,
-    airlines,
-    stops: (bestOut.stops || 0) + (bestRet.stops || 0),
-    legs: [...(bestOut.legs || []), ...(bestRet.legs || [])],
-    layovers_min: [...(bestOut.layovers_min || []), ...(bestRet.layovers_min || [])],
-    total_duration_min: (bestOut.total_duration_min || 0) + (bestRet.total_duration_min || 0),
+    airlines: Array.from(new Set([...(bestOut.airlines || []), ...(bestRet.airlines || [])])),
+    stops: bestOut.stops,
+    return_stops: bestRet.stops,
+    legs: bestOut.legs,
+    return_legs: bestRet.legs,
+    layovers_min: bestOut.layovers_min,
+    return_layovers_min: bestRet.layovers_min,
+    total_duration_min: bestOut.total_duration_min,
     origin_airport: task.o_out,
     return_airport: task.o_ret,
     dest_airport: task.dest,
     outbound_date: task.outbound,
     return_date: task.ret,
     stay_days: task.stay,
+    return_airlines: bestRet.airlines,
+    return_duration_min: bestRet.total_duration_min,
     open_jaw: true,
   }];
 }
@@ -673,6 +742,7 @@ async function searchOpenJaw(task, currency) {
  * `onProgress` is called after every completed lookup so the UI can stream.
  */
 async function runSearch(params, onProgress) {
+  _oneWayCache.clear(); // always quote fresh prices for a new search
   const origins = resolveLocations(params.origin);
   const dests = resolveLocations(params.destination);
   if (!origins.length) {
@@ -758,6 +828,7 @@ async function runSearch(params, onProgress) {
         tasks.push({
           kind: "rt", origin: pair[0], dest: pair[1], outbound,
           ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
+          maxStops: params.direct_only ? 0 : 2,
         });
         if (tasks.length >= budget) break outer;
       }
@@ -776,7 +847,8 @@ async function runSearch(params, onProgress) {
         if (oOut === oRet) continue;
         for (const d of dsts.slice(0, 2)) {
           if (oOut === d || oRet === d) continue;
-          tasks.push({ kind: "oj", o_out: oOut, o_ret: oRet, dest: d, outbound: ob, ret, stay });
+          tasks.push({ kind: "oj", o_out: oOut, o_ret: oRet, dest: d, outbound: ob, ret, stay,
+            maxStops: params.direct_only ? 0 : 1 });
           if (tasks.length >= budget + 3) break outer2;
         }
       }
@@ -790,11 +862,12 @@ async function runSearch(params, onProgress) {
 
   const startedAt = Date.now();
   // Allow more time when there are many lookups (thorough mode), so a big
-  // search isn't cut off early. Roughly 5s per lookup at the chosen
-  // concurrency, with the configured budget as a minimum.
+  // search isn't cut off early. Round-trip tasks also fetch the return
+  // direction (deduplicated by route+date), so scale with ~2 fetches per task.
+  const estFetches = tasks.length * 2;
   const timeBudgetMs = Math.max(
     window.SEARCH_TIME_BUDGET_MS || 90000,
-    Math.ceil(tasks.length / _concurrency()) * 5000
+    Math.ceil(estFetches / _concurrency()) * 4000
   );
   let done = 0;
   let errors = 0;
@@ -882,6 +955,7 @@ async function runSearch(params, onProgress) {
     max_days: maxDays,
     sample_outbounds: datesUsed,
     currency,
+    direct_only: !!params.direct_only,
     searches_performed: done,
     lookup_errors: errors,
     stopped_early: stopped || done >= maxSearches,
@@ -897,7 +971,9 @@ async function runSearch(params, onProgress) {
       "Country inputs expand to that country's commercial airports. The date window is capped at 31 days: " +
       "use \"Every day in window\" for full coverage, or \"Sampled days\" to spread a few days across it " +
       "(see the date breakdown). Lookups are capped (⚙️ settings) to respect the free reader. " +
-      "Round-trip prices are Google's own totals; the itinerary shown is the outbound (Google pairs the return automatically). " +
+      "Round-trip prices are Google's own totals; Google's round-trip page lists only the outbound itinerary, " +
+      "so the return flight shown is the cheapest return on that date (same airline when available), fetched separately. " +
+      (params.direct_only ? "Only nonstop itineraries were requested. " : "") +
       "Open-jaw totals are estimated from two separate one-ways.",
   };
 }
@@ -907,12 +983,72 @@ async function runSearch(params, onProgress) {
  * ------------------------------------------------------------------ */
 function renderFlight(f, badgeClass, badgeText) {
   if (!f) return "";
-  let legsHtml = "";
-  (f.legs || []).forEach((leg, i) => {
-    if (i > 0 && f.layovers_min && f.layovers_min[i - 1] != null) {
-      legsHtml += `<div class="layover">Layover: ${formatDuration(f.layovers_min[i - 1])}</div>`;
+  const out = _dirSummary(f.legs, f.airlines, f.stops);
+  const ret = f.return_legs ? _dirSummary(f.return_legs, f.return_airlines, f.return_stops) : null;
+  const oj = f.open_jaw ? " · Open-jaw" : "";
+  let html = `
+    <div class="flight-card ${badgeClass}">
+      <span class="badge ${badgeClass === "best-direct" ? "green" : "blue"}">${badgeText}</span>
+      <div class="price">${f.price != null ? f.price + " " + (window._currency || "USD") : "N/A"}</div>`;
+
+  // Outbound: departure airport · date · departure & arrival time · airline · stay days
+  if (out) {
+    html += `
+      <div class="dir">
+        <span class="dir-label">Outbound</span>
+        <span class="dir-main"><strong>${out.route}</strong> · ${out.date} · ${out.times} · ${out.airlines} · ${out.stops}${f.stay_days != null ? ` · ${f.stay_days} days stay` : ""}</span>
+      </div>`;
+    html += _legsDetail(f.legs, f.layovers_min);
+  }
+  // Return: exactly the same sequence for the return flight
+  if (ret) {
+    html += `
+      <div class="dir">
+        <span class="dir-label ret">Return</span>
+        <span class="dir-main"><strong>${ret.route}</strong> · ${ret.date} · ${ret.times} · ${ret.airlines} · ${ret.stops}</span>
+      </div>`;
+    html += _legsDetail(f.return_legs, f.return_layovers_min);
+  } else if (f.return_date) {
+    html += `
+      <div class="dir">
+        <span class="dir-label ret">Return</span>
+        <span class="dir-main dir-unavailable"><strong>${f.dest_airport || ""} → ${f.return_airport || f.origin_airport}</strong> · ${fmtDate(f.return_date)} · times/airline unavailable</span>
+      </div>`;
+  }
+  html += `
+      <div class="meta">Flight time: outbound ${formatDuration(f.total_duration_min)}` +
+    (f.return_duration_min != null ? ` · return ${formatDuration(f.return_duration_min)}` : "") +
+    `${oj}</div>
+    </div>`;
+  return html;
+}
+
+/** One-line summary of one direction: airports · date · times · airlines · stops. */
+function _dirSummary(legs, airlines, stops) {
+  if (!legs || !legs.length) return null;
+  const first = legs[0], last = legs[legs.length - 1];
+  const [depDate, depTime] = String(first.departure || "").split(" ");
+  const [arrDate, arrTime] = String(last.arrival || "").split(" ");
+  const arr = (arrDate && arrDate !== depDate) ? `${arrDate} ${arrTime}` : (arrTime || "—");
+  const n = stops != null ? stops : Math.max(0, legs.length - 1);
+  return {
+    route: `${first.from} → ${last.to}`,
+    date: depDate || "—",
+    times: `${depTime || "—"} – ${arr || "—"}`,
+    airlines: (airlines || []).join(", ") || "—",
+    stops: n === 0 ? "Direct" : (n === 1 ? "1 stop" : n + " stops"),
+  };
+}
+
+/** Per-leg detail rows, only needed when the direction has connections. */
+function _legsDetail(legs, layovers) {
+  if (!legs || legs.length < 2) return "";
+  let html = "";
+  legs.forEach((leg, i) => {
+    if (i > 0 && layovers && layovers[i - 1] != null) {
+      html += `<div class="layover">Layover: ${formatDuration(layovers[i - 1])}</div>`;
     }
-    legsHtml += `
+    html += `
       <div class="leg">
         <strong>${leg.from} → ${leg.to}</strong>
         <span>${leg.departure} → ${leg.arrival}</span>
@@ -920,28 +1056,25 @@ function renderFlight(f, badgeClass, badgeText) {
         ${leg.plane ? `<span style="color:var(--muted)">${leg.plane}</span>` : ""}
       </div>`;
   });
-  const stopsLabel = f.stops === 0 ? "Direct" : (f.stops === 1 ? "1 stop" : (f.stops || 0) + " stops");
-  const route = `${f.origin_airport || ""}` +
-    (f.return_airport && f.return_airport !== f.origin_airport ? " ↩ " + f.return_airport : "") +
-    ` → ${f.dest_airport || ""}`;
-  const dates = f.outbound_date ? `${fmtDate(f.outbound_date)} → ${fmtDate(f.return_date)} (${f.stay_days || "?"}d)` : "";
-  const oj = f.open_jaw ? " · Open-jaw" : "";
-  return `
-    <div class="flight-card ${badgeClass}">
-      <span class="badge ${badgeClass === "best-direct" ? "green" : "blue"}">${badgeText}</span>
-      <div class="price">${f.price != null ? f.price + " " + (window._currency || "USD") : "N/A"}</div>
-      <div class="meta">
-        ${route} · ${dates} · ${(f.airlines || []).join(", ")} · ${stopsLabel}${oj} · Total ${formatDuration(f.total_duration_min)}
-      </div>
-      ${legsHtml}
-    </div>`;
+  return html;
 }
 
-function _legTimes(f) {
-  const legs = f.legs || [];
-  if (!legs.length) return { outDep: "—", outArr: "—" };
-  const t = (s) => ((s || "").split(" ").pop()) || "—";
-  return { outDep: t(legs[0].departure), outArr: t(legs[legs.length - 1].arrival) };
+/** Table cell for a direction: airport · date · times · airline · stops. */
+function _dirCell(legs, airlines, stops) {
+  const s = _dirSummary(legs, airlines, stops);
+  if (!s) return `<span class="dir-unavailable">—</span>`;
+  return `<strong>${s.route}</strong><br>` +
+    `<span class="dir-unavailable">${s.date} · ${s.times} · ${s.airlines} · ${s.stops}</span>`;
+}
+
+/** Table cell for the return direction (with a fallback when details are missing). */
+function _returnCell(f) {
+  if (f.return_legs) return _dirCell(f.return_legs, f.return_airlines, f.return_stops);
+  if (f.return_date) {
+    return `<strong>${f.dest_airport || ""} → ${f.return_airport || f.origin_airport}</strong><br>` +
+      `<span class="dir-unavailable">${fmtDate(f.return_date)} · times/airline unavailable</span>`;
+  }
+  return `<span class="dir-unavailable">—</span>`;
 }
 
 function renderResults(data) {
@@ -951,6 +1084,7 @@ function renderResults(data) {
     <span><strong>${data.origin_input}</strong> → <strong>${data.destination_input}</strong></span>
     <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
     <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days</span>
+    ${data.direct_only ? `<span>Direct (nonstop) only</span>` : ""}
     <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? " · partial (limit reached)" : ""}</span>
   `;
 
@@ -963,28 +1097,17 @@ function renderResults(data) {
   if (ranked.length) {
     html += `<div class="section-title">All cheapest options (sorted by price)</div>`;
     html += `<div class="results-table-wrap"><table class="results-table"><thead><tr>
-      <th>#</th><th>Price</th><th>From → To</th><th>Return apt</th>
-      <th>Outbound date</th><th>Out dep</th><th>Out arr</th>
-      <th>Return date</th><th>Stay</th><th>Stops</th><th>Airlines</th><th>Type</th>
+      <th>#</th><th>Price</th><th>Outbound flight</th><th>Return flight</th><th>Stay</th><th>Type</th>
     </tr></thead><tbody>`;
     ranked.forEach((f, i) => {
-      const from = f.origin_airport || "—";
-      const to = f.dest_airport || "—";
-      const ret = f.return_airport || from;
-      const stops = f.stops === 0 ? "Direct" : (f.stops || 0) + " stop(s)";
-      const airlines = (f.airlines || []).join(", ") || "—";
       const type = f.open_jaw ? "Open-jaw" : "Round-trip";
-      const t = _legTimes(f);
       html += `<tr>
         <td class="rank-cell">${i + 1}</td>
         <td class="price-cell">${f.price != null ? f.price + " " + cur : "—"}</td>
-        <td><strong>${from}</strong> → <strong>${to}</strong></td>
-        <td>${ret}</td>
-        <td>${fmtDate(f.outbound_date) || "—"}</td>
-        <td>${t.outDep}</td><td>${t.outArr}</td>
-        <td>${fmtDate(f.return_date) || "—"}</td>
+        <td>${_dirCell(f.legs, f.airlines, f.stops)}</td>
+        <td>${_returnCell(f)}</td>
         <td>${f.stay_days != null ? f.stay_days + "d" : "—"}</td>
-        <td>${stops}</td><td>${airlines}</td><td>${type}</td>
+        <td>${type}</td>
       </tr>`;
     });
     html += `</tbody></table></div>`;
@@ -996,18 +1119,14 @@ function renderResults(data) {
   if (dateRows.length > 1) {
     html += `<div class="section-title">Cheapest by departure date (sampled across your window)</div>`;
     html += `<div class="results-table-wrap"><table class="results-table"><thead><tr>
-      <th>Outbound date</th><th>Cheapest</th><th>From → To</th><th>Stops</th><th>Airlines</th><th>Out times</th>
+      <th>Outbound flight</th><th>Cheapest</th><th>Return flight</th>
     </tr></thead><tbody>`;
     dateRows.forEach((row) => {
       const f = row.cheapest;
-      const t = _legTimes(f);
       html += `<tr>
-        <td><strong>${fmtDate(row.date)}</strong></td>
+        <td>${_dirCell(f.legs, f.airlines, f.stops)}</td>
         <td class="price-cell">${f.price != null ? f.price + " " + cur : "—"}</td>
-        <td>${f.origin_airport || "—"} → ${f.dest_airport || "—"}</td>
-        <td>${f.stops === 0 ? "Direct" : (f.stops || 0) + " stop(s)"}</td>
-        <td>${(f.airlines || []).join(", ") || "—"}</td>
-        <td>${t.outDep}→${t.outArr}</td>
+        <td>${_returnCell(f)}</td>
       </tr>`;
     });
     html += `</tbody></table></div>`;
@@ -1016,31 +1135,27 @@ function renderResults(data) {
   if (data.per_origin_summary && data.per_origin_summary.length) {
     html += `<div class="section-title">Per departure airport (best found)</div>`;
     html += `<div class="results-table-wrap"><table class="results-table"><thead><tr>
-      <th>Airport</th><th>City</th><th>Best price</th><th>Stops</th>
-      <th>Outbound</th><th>Out times</th><th>Return</th><th>Stay</th><th>Airlines</th><th>Status</th>
+      <th>Airport</th><th>City</th><th>Best price</th>
+      <th>Outbound flight</th><th>Return flight</th><th>Stay</th><th>Status</th>
     </tr></thead><tbody>`;
     data.per_origin_summary.forEach((row) => {
       const a = row.airport || {};
       const best = row.cheapest_any;
       if (best) {
-        const t = _legTimes(best);
         html += `<tr>
           <td><strong>${a.code || "—"}</strong></td>
           <td>${a.city || a.name || "—"}</td>
           <td class="price-cell">${best.price != null ? best.price + " " + cur : "—"}</td>
-          <td>${best.stops === 0 ? "Direct" : (best.stops || 0) + " stop(s)"}</td>
-          <td>${fmtDate(best.outbound_date) || "—"}</td>
-          <td>${t.outDep}→${t.outArr}</td>
-          <td>${fmtDate(best.return_date) || "—"}</td>
+          <td>${_dirCell(best.legs, best.airlines, best.stops)}</td>
+          <td>${_returnCell(best)}</td>
           <td>${best.stay_days != null ? best.stay_days + "d" : "—"}</td>
-          <td>${(best.airlines || []).join(", ") || "—"}</td>
           <td>Verified</td>
         </tr>`;
       } else {
         html += `<tr style="opacity:0.55">
           <td><strong>${a.code || "—"}</strong></td>
           <td>${a.city || a.name || "—"}</td>
-          <td colspan="8">—</td>
+          <td colspan="5">—</td>
         </tr>`;
       }
     });
@@ -1132,6 +1247,7 @@ function wire() {
       date_mode: $("date_mode") ? $("date_mode").value : "sampled",
       currency: $("currency").value,
       open_jaw: $("open_jaw").value === "true",
+      direct_only: $("direct_only") ? $("direct_only").checked : false,
     };
     window._currency = params.currency;
     saveSettings();

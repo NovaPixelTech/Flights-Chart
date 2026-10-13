@@ -10,7 +10,7 @@
   <div class="container">
     <header>
       <h1>✈️ Cheap Flights Finder</h1>
-      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Open-jaw supported</p>
+      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Open-jaw supported · Direct-only filter · Outbound <em>and</em> return details</p>
       <div class="status-row">
         <span class="pill" id="dataPill"><span class="dot"></span><span id="dataPillText">data: live Google Flights</span></span>
         <span class="pill" id="airportPill"><span class="dot"></span><span id="airportPillText">airports: loading…</span></span>
@@ -70,6 +70,12 @@
               <option value="true">Yes</option>
               <option value="false">No (same airport return)</option>
             </select>
+          </div>
+          <div class="full">
+            <label class="inline-check" for="direct_only">
+              <input type="checkbox" id="direct_only" name="direct_only" />
+              <span>Direct flights only (nonstop)</span>
+            </label>
           </div>
         </div>
         <button type="submit" class="btn" id="submitBtn">

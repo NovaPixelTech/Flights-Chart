@@ -3,7 +3,9 @@
 Web app that finds the **cheapest direct flight** and the **cheapest flight with at most
 2 stops** (stopover ≤ 3 hours) between two cities/airports for a vacation of a given length.
 Supports country inputs (expands to that country's commercial airports), flexible date
-windows, stay-length ranges, and open-jaw (different return airport).
+windows, stay-length ranges, open-jaw (different return airport), and an optional
+**direct-only (nonstop)** filter. Every result lists the **outbound and the return** flight
+(airport, `dd.mm.yyyy` date, times, airline) plus the number of stay days.
 
 **Live flight prices. Completely static. No backend, no accounts, no API keys, no credit card.**
 It runs entirely in the browser on GitHub Pages.
@@ -67,7 +69,7 @@ Your site is live at `https://<user>.github.io/<repo>/`.
 | `FLIGHT_READER` | `https://r.jina.ai/` | The reader/fetcher prefix. |
 | `FLIGHT_READER_KEY` | `""` | Optional reader API key — only **raises rate limits**; never required. |
 | `FLIGHT_GOOGLE_HOSTS` | `["www.google.co.uk", "www.google.ca", …]` | Google domains tried in order until real flight data is returned. |
-| `MAX_SEARCHES` | `12` | Max route/date lookups per search (one reader request each). |
+| `MAX_SEARCHES` | `12` | Max route/date lookups per search (a round trip uses one lookup for the outbound plus one for the return, de-duplicated). |
 | `SEARCH_CONCURRENCY` | `3` | How many reader requests run at once. |
 | `SEARCH_TIME_BUDGET_MS` | `90000` | Give up and show partial results after this long. |
 
@@ -94,9 +96,16 @@ python -m http.server 8000 --directory docs
   Choose **"Every day in window"** to check each calendar day for the primary route instead
   (more requests — raise the lookup cap accordingly). Country inputs expand to the main
   commercial airports, capped as well.
-- **Round-trip detail.** Google returns its own round-trip totals; the itinerary shown is the
-  outbound leg (Google pairs the return automatically). Open-jaw totals are estimated from two
-  separate one-ways.
+- **Round-trip detail.** Google's round-trip page returns its round-trip total price but lists
+  only the **outbound** itinerary. The app therefore fetches the **return direction separately**
+  (one extra lookup per return date, de-duplicated) and shows the cheapest return on that date
+  for the same airline when available. The price shown is always Google's own round-trip total.
+  Open-jaw totals are estimated from two separate one-ways.
+- **Every flight shows both directions** in a fixed order: departure airport → departure date →
+  departure &amp; arrival time → airline → stay days (outbound), then the same for the return.
+  All dates are shown as `dd.mm.yyyy`.
+- **Direct-only.** Tick *Direct flights only (nonstop)* to restrict every lookup (outbound and
+  return) to nonstop itineraries.
 - Prices are live estimates only — not bookable through this app.
 - City resolution works best for major cities; prefer IATA codes (JFK, LHR, CDG, …) for
   reliability.
