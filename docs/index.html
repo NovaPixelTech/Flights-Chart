@@ -49,7 +49,7 @@
           <div>
             <label for="date_mode">Date coverage</label>
             <select id="date_mode" name="date_mode">
-              <option value="every">Every day (most accurate — more lookups)</option>
+              <option value="every">Every day in window (most accurate — extra days swept for the cheapest routes)</option>
               <option value="sampled">Sampled days (faster — may miss some dates)</option>
             </select>
           </div>
@@ -90,18 +90,25 @@
         <div class="settings-body">
           <label for="readerUrl">Reader / fetcher prefix</label>
           <input id="readerUrl" placeholder="https://r.jina.ai/" autocomplete="off" spellcheck="false" />
-          <label for="readerKey">Reader API key (optional — raises rate limits)</label>
+          <label for="readerKey">Reader API key (optional — raises the lookup rate limit)</label>
           <input id="readerKey" placeholder="leave blank to stay key-less" autocomplete="off" spellcheck="false" />
-          <label for="maxSearches">Lookup budget per search (more = more dates checked; every airport pair is always attempted)</label>
-          <input id="maxSearches" type="number" min="1" max="120" />
+          <label for="maxSearches">Lookup ceiling per search (higher = more dates swept per route; slower)</label>
+          <input id="maxSearches" type="number" min="1" max="400" />
           <label for="googleHosts">Google domains to try (comma-separated, in order)</label>
           <input id="googleHosts" placeholder="www.google.co.uk, www.google.ca, www.google.com" autocomplete="off" spellcheck="false" />
           <p class="hint">
             This page is <strong>100% static</strong> — no servers, no accounts, no API keys required.
             It asks a public reader service to render the Google&nbsp;Flights results page, then parses
-            the prices right here in your browser. A free key is optional and only lifts rate limits.
-            If the reader blocks one Google domain, the app automatically tries the next one in the list.
-            Settings are saved in <em>your</em> browser only.
+            the prices right here in your browser. If the reader blocks one Google domain, the app
+            automatically tries the next one in the list. Settings are saved in <em>your</em> browser only.
+          </p>
+          <p class="hint">
+            <strong>Why a big search takes a few minutes:</strong> the key-less reader serves roughly
+            <strong>20 lookups per minute</strong> per visitor (one lookup = one Google&nbsp;Flights page),
+            and answers <em>HTTP&nbsp;429</em> past that. Rather than failing, the app now queues its
+            lookups under that rate and shows the wait in the progress line — a 80-lookup sweep lands
+            around 4–5 minutes. A <strong>free reader API key</strong> lifts the limit, so paste one here
+            if you want to sweep big airport sets (or raise the ceiling) quickly.
           </p>
         </div>
       </details>

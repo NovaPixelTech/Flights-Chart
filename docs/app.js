@@ -321,8 +321,8 @@ function currentReaderKey() {
 
 function currentMaxSearches() {
   const typed = parseInt(($("maxSearches") && $("maxSearches").value) || "", 10);
-  const val = Number.isFinite(typed) && typed > 0 ? typed : (window.MAX_SEARCHES || 12);
-  return Math.max(1, Math.min(120, val));
+  const val = Number.isFinite(typed) && typed > 0 ? typed : (window.MAX_SEARCHES || 80);
+  return Math.max(1, Math.min(400, val));
 }
 
 function _concurrency() {
@@ -342,6 +342,52 @@ function googleHosts() {
 
 // Remember the last host that worked so we don't re-probe blocked ones every time.
 let _preferredHost = 0;
+
+/* ------------------------------------------------------------------ *
+ *  Reader rate limiter
+ * ------------------------------------------------------------------ *
+ *  The key-less reader serves only ~20 lookups per rolling minute and
+ *  answers HTTP 429 beyond that. Rather than firing until it breaks, every
+ *  reader request is admitted through this rolling-window queue: once the
+ *  window is full we sleep until the oldest request ages out. A 429 (someone
+ *  else on the same connection, or a burst) adds a short penalty so the
+ *  queue backs off instead of failing the search.
+ * ------------------------------------------------------------------ */
+const _readerLog = [];
+let _readerPenaltyUntil = 0;
+
+function _readerRate() {
+  const n = Number(window.READER_MAX_PER_MINUTE);
+  return Math.max(2, Math.min(60, Number.isFinite(n) && n > 0 ? n : 18));
+}
+
+function _readerThrottledMs() {
+  const penalty = _readerPenaltyUntil - Date.now();
+  if (penalty > 0) return penalty;
+  if (_readerLog.length < _readerRate()) return 0;
+  return Math.max(0, 60000 - (Date.now() - _readerLog[0]));
+}
+
+async function _readerAdmit() {
+  for (;;) {
+    const now = Date.now();
+    while (_readerLog.length && now - _readerLog[0] > 60000) _readerLog.shift();
+    const penalty = _readerPenaltyUntil - now;
+    if (penalty > 0) {
+      await _sleep(Math.min(penalty, 3000));
+      continue;
+    }
+    if (_readerLog.length < _readerRate()) {
+      _readerLog.push(now);
+      return;
+    }
+    await _sleep(Math.max(250, Math.min(60000 - (now - _readerLog[0]) + 120, 4000)));
+  }
+}
+
+function _readerPenalty(ms) {
+  _readerPenaltyUntil = Math.max(_readerPenaltyUntil, Date.now() + ms);
+}
 
 async function _readerGet(url, timeoutMs) {
   const headers = { "x-respond-with": "html" };
@@ -377,17 +423,24 @@ async function fetchGoogleFlightsHtml(tfs, currency, timeoutMs = 70000) {
     const host = hosts[idx];
     const url = currentReader() + `https://${host}/travel/flights?${qs}`;
     try {
+      await _readerAdmit(); // stay inside the reader's per-minute quota
       const { ok, status, text } = await _readerGet(url, timeoutMs);
       if (ok && text.indexOf('class="ds:1"') !== -1) {
         _preferredHost = idx; // remember the working host
         return text;
       }
       if (status === 429) {
+        // Quota exhausted (per visitor IP, shared with every other tab/app on
+        // this connection). Back off — the queue plus _withRetry will retry
+        // once the rolling window frees up.
+        _readerPenalty(25000);
         const err = new Error(
-          "The public reader is rate-limiting right now (HTTP 429). Wait a moment and retry, or add a free reader API key in ⚙️ settings."
+          "The public reader is rate-limiting (HTTP 429) — it allows about " +
+          `${_readerRate()} lookups a minute. The search waits and retries automatically; ` +
+          "a free reader API key in ⚙️ settings removes the wait."
         );
         err.status = 429;
-        throw err; // rotating hosts won't help a rate limit
+        throw err;
       }
       lastErr = new Error(
         `Reader returned ${status} for ${host}${ok ? " (page had no flight data)" : ""}.`
@@ -409,7 +462,7 @@ async function fetchGoogleFlightsHtml(tfs, currency, timeoutMs = 70000) {
   throw err;
 }
 
-async function _withRetry(fn, tries = 3) {
+async function _withRetry(fn, tries = 4) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try { return await fn(); }
@@ -417,7 +470,13 @@ async function _withRetry(fn, tries = 3) {
       lastErr = e;
       // Don't retry hard 4xx errors (except 429 rate-limit).
       if (e.status && e.status !== 429 && e.status < 500) throw e;
-      await _sleep(800 * Math.pow(2, i) + Math.floor(Math.random() * 400));
+      if (e.status === 429) {
+        _readerPenalty(25000 + i * 5000);
+        await _sleep(Math.min(60000, 8000 + i * 8000) + Math.floor(Math.random() * 800));
+        if (i >= 3) tries = Math.min(tries + 1, 8); // a rate limit deserves patience
+      } else {
+        await _sleep(800 * Math.pow(2, i) + Math.floor(Math.random() * 400));
+      }
     }
   }
   throw lastErr;
@@ -604,6 +663,7 @@ function toFlightDict(opt, ctx, airlineNames) {
     outbound_date: ctx.outbound,
     return_date: ctx.ret || null,
     stay_days: ctx.stay != null ? ctx.stay : null,
+    max_stops: ctx.maxStops != null ? ctx.maxStops : null,
     open_jaw: !!ctx.openJaw,
   };
 }
@@ -636,6 +696,24 @@ function spreadDates(start, end, count) {
     out.push(isoLocal(addDays(start, Math.round((i * span) / (count - 1)))));
   }
   return Array.from(new Set(out));
+}
+
+/**
+ * Reorder dates so partial coverage is spread evenly across the list instead of
+ * leaving a contiguous stretch unchecked: the middle of a range first, then the
+ * middles of the two halves, and so on (a breadth-first bisection).
+ */
+function bisectionOrder(dates) {
+  const out = [];
+  const queue = [[0, dates.length - 1]];
+  while (queue.length) {
+    const [lo, hi] = queue.shift();
+    if (lo > hi) continue;
+    const mid = (lo + hi) >> 1;
+    out.push(dates[mid]);
+    queue.push([lo, mid - 1], [mid + 1, hi]);
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ *
@@ -684,7 +762,43 @@ function attachReturnLeg(f, returnOptions, maxStops) {
   f.return_layovers_min = pick.layovers_min;
 }
 
-async function searchOneRoute(task, currency) {
+/**
+ * Fetch the return direction once per (route, return date, stops) and attach
+ * it to every flight that is going to be displayed. Runs after the price sweep
+ * so the sweep itself only costs one fetch per lookup.
+ */
+async function attachReturnsToDisplay(flights, currency, onProgress, limit) {
+  const groups = new Map();
+  for (const f of flights) {
+    if (!f || f.open_jaw || !f.return_date || (f.return_legs && f.return_legs.length)) continue;
+    const key = [f.dest_airport, f.origin_airport, f.return_date, f.max_stops == null ? 2 : f.max_stops].join("|");
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  }
+  let keys = Array.from(groups.keys());
+  const capped = keys.length > limit;
+  if (capped) keys = keys.slice(0, limit);
+  const queue = keys.slice();
+  let done = 0;
+  async function worker() {
+    while (queue.length) {
+      const key = queue.shift();
+      const [dest, origin, ret, ms] = key.split("|");
+      const maxStops = Number(ms);
+      try {
+        const opts = await fetchOneWayOptions(dest, origin, ret, maxStops, currency);
+        for (const f of groups.get(key)) attachReturnLeg(f, opts, maxStops);
+      } catch (e) { /* best effort */ }
+      done++;
+      if (onProgress) onProgress({ phase: "returns", done, total: keys.length });
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(_concurrency(), keys.length) }, worker));
+  return { requested: keys.length, capped };
+}
+
+async function searchOneRoute(task, currency, opts) {
+  const withReturn = !opts || opts.withReturn !== false;
   const maxStops = task.maxStops != null ? task.maxStops : 2;
   const legs = [{
     date: task.outbound, from: task.origin, to: task.dest, maxStops, maxLayover: 180,
@@ -695,9 +809,14 @@ async function searchOneRoute(task, currency) {
     legs.push({ date: task.ret, from: task.dest, to: task.origin, maxStops, maxLayover: 180 });
     trip = "round-trip";
     // Google's round-trip response lists only the OUTBOUND itinerary (the price
-    // is the round-trip total), so fetch the return direction separately in
-    // order to show the return flight's airport, date, times and airline.
-    returnPromise = fetchOneWayOptions(task.dest, task.origin, task.ret, maxStops, currency);
+    // is the round-trip total), so the return direction must be fetched
+    // separately to show the return flight's airport, date, times and airline.
+    // During the price sweep this is deferred (`withReturn: false`) so each
+    // lookup costs a single fetch; returns are fetched once, afterwards, only
+    // for the flights that are actually displayed.
+    if (withReturn) {
+      returnPromise = fetchOneWayOptions(task.dest, task.origin, task.ret, maxStops, currency);
+    }
   }
   const tfs = buildTfs({ legs, trip, currency });
   const [html, returnOptions] = await Promise.all([
@@ -711,6 +830,7 @@ async function searchOneRoute(task, currency) {
     const d = toFlightDict(opt, {
       origin: task.origin, dest: task.dest, returnAirport: task.origin,
       outbound: task.outbound, ret: task.ret, stay: task.stay, openJaw: false,
+      maxStops,
     }, airlineNames);
     if (maxStops === 0 && d.stops > 0) continue;
     if (d.stops > 0 && d.layovers_min.some((l) => l > 180)) continue;
@@ -825,76 +945,80 @@ async function runSearch(params, onProgress) {
   for (let s = minDays; s <= maxDays; s++) stayLengths.push(s);
 
   const currency = params.currency || "USD";
-  const maxSearches = currentMaxSearches();
+  const lookupCeiling = currentMaxSearches();
 
-  // ---- spend the (limited) lookup budget wisely ----
-  // Coverage priorities: (1) every origin→destination airport pair,
-  // (2) every stay length the user asked for, (3) every calendar day in the
-  // window. The budget is finite, so the lowest priority is reduced first.
-  // Crucially, airports are only skipped if the budget cannot cover the pairs
-  // even once — and the results always report exactly what was covered.
+  // ---- plan the sweep ----
+  // One "route" = an origin→destination airport pair × a stay length. The full
+  // grid (routes × every calendar day) is far too many lookups for anything but
+  // a single route, so the sweep runs in two passes:
+  //   1. a broad pass over every route on a few spread-out days, then
+  //   2. a deep pass that sweeps EVERY remaining day for the routes that looked
+  //      cheapest in pass 1.
+  // Pass 2 is what catches a cheap date that an evenly spaced sample steps over
+  // (e.g. a Sun→Sun week that a "1st / 8th / 15th" sample would miss).
+  // Each sweep lookup is outbound-only (one fetch); return flights are fetched
+  // afterwards, once, and only for the flights that get displayed.
   const pairs = [];
   for (const o of orgs) for (const d of dsts) if (o !== d) pairs.push([o, d]);
   if (!pairs.length) pairs.push([orgs[0], dsts[0]]); // same airport in and out
 
   const thorough = params.date_mode === "every";
+  const maxStopsForSearch = params.direct_only ? 0 : 2;
 
-  // Hard ceiling so "all airports of country A → all of country B" cannot
-  // explode into thousands of requests (~2 fetches per task: outbound+return).
-  const TASK_CEILING = 120;
+  const allDates = [];
+  for (let i = 0; i < windowDays; i++) allDates.push(isoLocal(addDays(start, i)));
 
   let nPairs = pairs.length;
-  let nStays = stayLengths.length;
-  let floorTasks = nPairs * nStays; // one date per pair × every stay length
-  if (floorTasks > TASK_CEILING) {
-    nPairs = Math.max(1, Math.floor(TASK_CEILING / nStays));
-    floorTasks = nPairs * nStays;
+  const nStays = stayLengths.length;
+  if (nPairs * nStays > lookupCeiling) {
+    nPairs = Math.max(1, Math.floor(lookupCeiling / nStays));
   }
+  const routePairs = pairs.slice(0, nPairs);
+  const routeCount = Math.max(1, routePairs.length * nStays);
 
-  // "Every day" covers the entire window whenever the whole grid is affordable
-  // (single routes and small multi-airport searches). Otherwise the lookup
-  // budget is spread in priority order: every airport pair × every stay length
-  // first, then as many calendar days as the budget allows. The configured cap
-  // is treated as a *floor* when more airports still need covering, so no
-  // airport is ever silently dropped.
-  let nDates, budget;
-  const fullGrid = nPairs * nStays * windowDays;
-  if (thorough && fullGrid <= TASK_CEILING) {
-    budget = fullGrid; // full window coverage is affordable
+  // How many days the broad pass covers. "Every day in window" spends only part
+  // of the budget here so the deep pass can sweep whole calendars; "Sampled
+  // days" stops after the broad pass.
+  const fullGrid = routeCount * windowDays;
+  let broadCount;
+  if (fullGrid <= lookupCeiling) {
+    broadCount = windowDays; // everything fits — one pass, every day
+  } else if (thorough) {
+    broadCount = Math.max(1, Math.min(windowDays, Math.floor((lookupCeiling * 0.4) / routeCount)));
   } else {
-    const wanted = thorough ? floorTasks * 2 : floorTasks;
-    budget = Math.min(TASK_CEILING, Math.max(maxSearches, wanted));
+    broadCount = Math.max(1, Math.min(windowDays, Math.min(8, Math.floor((lookupCeiling * 0.5) / routeCount) || 1)));
   }
-  nDates = Math.min(windowDays, Math.max(1, Math.floor(budget / floorTasks)));
+  const broadDates = spreadDates(start, end, broadCount);
 
-  const datesUsed = spreadDates(start, end, nDates);
-  const staysUsed = stayLengths.slice(0, Math.max(1, nStays));
-  const totalTasks = Math.max(1, nPairs * datesUsed.length * staysUsed.length);
-
-  // ---- build the task list: airport pair → date → stay ----
-  const tasks = [];
   const searchedOrigins = new Set();
-  taskLoop:
-  for (const pair of pairs.slice(0, nPairs)) {
-    for (const outbound of datesUsed) {
-      for (const stay of staysUsed) {
-        if (tasks.length >= totalTasks) break taskLoop;
-        tasks.push({
-          kind: "rt", origin: pair[0], dest: pair[1], outbound,
-          ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
-          maxStops: params.direct_only ? 0 : 2,
-        });
-        searchedOrigins.add(pair[0]);
-      }
+  const sweptKeys = new Set(); // "origin|dest|stay|date" — every lookup we actually ran
+  const routeKey = (o, d, s) => `${o}|${d}|${s}`;
+  const sweepKey = (o, d, s, date) => `${o}|${d}|${s}|${date}`;
+  const rtTask = (origin, dest, outbound, stay) => {
+    searchedOrigins.add(origin);
+    sweptKeys.add(sweepKey(origin, dest, stay, outbound));
+    return {
+      kind: "rt", origin, dest, outbound,
+      ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
+      maxStops: maxStopsForSearch,
+    };
+  };
+
+  // ---- pass 1: broad grid, every route on the broad dates ----
+  const broadTasks = [];
+  for (const pair of routePairs) {
+    for (const outbound of broadDates) {
+      for (const stay of stayLengths) broadTasks.push(rtTask(pair[0], pair[1], outbound, stay));
     }
   }
 
   // ---- optional open-jaw tasks (different return airport) ----
-  // Kept outside the coverage grid so "every day" mode doesn't swallow them.
+  // Kept outside the sweep grid so a big sweep never swallows them.
+  const ojTasks = [];
   if (params.open_jaw && orgs.length > 1) {
     const top = orgs.slice(0, 5);
-    const ob = datesUsed[0];
-    const stay = staysUsed[0];
+    const ob = allDates[0];
+    const stay = stayLengths[0];
     const ret = isoLocal(addDays(parseISODate(ob), stay));
     let added = 0;
     outer2:
@@ -903,7 +1027,7 @@ async function runSearch(params, onProgress) {
         if (oOut === oRet) continue;
         for (const d of dsts.slice(0, 2)) {
           if (oOut === d || oRet === d) continue;
-          tasks.push({ kind: "oj", o_out: oOut, o_ret: oRet, dest: d, outbound: ob, ret, stay,
+          ojTasks.push({ kind: "oj", o_out: oOut, o_ret: oRet, dest: d, outbound: ob, ret, stay,
             maxStops: params.direct_only ? 0 : 1 });
           searchedOrigins.add(oOut);
           if (++added >= 6) break outer2;
@@ -912,26 +1036,48 @@ async function runSearch(params, onProgress) {
     }
   }
 
+  const planned = { sweep: broadTasks.length + ojTasks.length, deep: 0, returns: 0 };
+
   // ---- execute with a small worker pool ----
   const all = [];
   const perOrigin = {};
   for (const o of orgs) perOrigin[o] = { direct: null, connecting: null, any: null };
 
   const startedAt = Date.now();
-  // Allow more time when there are many lookups (thorough mode), so a big
-  // search isn't cut off early. Round-trip tasks also fetch the return
-  // direction (deduplicated by route+date), so scale with ~2 fetches per task.
-  const estFetches = tasks.length * 2;
-  const timeBudgetMs = Math.max(
-    window.SEARCH_TIME_BUDGET_MS || 90000,
-    Math.ceil(estFetches / _concurrency()) * 4000
-  );
+  const returnLimit = (() => {
+    const n = Number(window.RETURN_FETCH_LIMIT);
+    return Number.isFinite(n) && n > 0 ? Math.min(80, n) : 16;
+  })();
+  // Every lookup and every return fetch is one reader request, and the reader
+  // allows ~_readerRate() of them a minute, so the wall-clock cost is the
+  // request count divided by that rate. Keep a generous ceiling on top.
+  const requestedTotal = () =>
+    (planned.sweep + planned.deep) + Math.min(returnLimit, planned.returns || returnLimit);
+  const timeBudgetMs = () =>
+    Math.max(
+      window.SEARCH_TIME_BUDGET_MS || 900000,
+      Math.ceil(requestedTotal() / _readerRate()) * 60000 + 120000
+    );
+  const estimateMinutes = () => Math.max(1, Math.ceil(requestedTotal() / _readerRate()));
   let done = 0;
   let errors = 0;
   let lastError = null;
   let stopped = false;
+  let currentPhase = "routes";
 
-  const queue = tasks.slice();
+  function emitProgress() {
+    if (!onProgress) return;
+    onProgress({
+      phase: currentPhase,
+      done,
+      total: planned.sweep + planned.deep,
+      found: all.length,
+      errors,
+      throttleMs: _readerThrottledMs(),
+      elapsedMs: Date.now() - startedAt,
+      etaMinutes: estimateMinutes(),
+    });
+  }
 
   function record(f) {
     all.push(f);
@@ -945,32 +1091,107 @@ async function runSearch(params, onProgress) {
     }
   }
 
-  async function worker() {
-    while (queue.length) {
-      if (Date.now() - startedAt > timeBudgetMs) { stopped = true; return; }
-      const task = queue.shift();
-      try {
-        const found = task.kind === "oj"
-          ? await searchOpenJaw(task, currency)
-          : await searchOneRoute(task, currency);
-        for (const f of found) record(f);
-      } catch (e) {
-        errors++;
-        lastError = e;
-      } finally {
-        done++;
-        if (onProgress) onProgress({ done, total: tasks.length, found: all.length, errors });
+  async function runPass(taskList, label) {
+    const queue = taskList.slice();
+    let passDone = 0;
+    currentPhase = label;
+    async function worker() {
+      while (queue.length) {
+        if (stopped || Date.now() - startedAt > timeBudgetMs()) { stopped = true; return; }
+        const task = queue.shift();
+        try {
+          const found = task.kind === "oj"
+            ? await searchOpenJaw(task, currency)
+            : await searchOneRoute(task, currency, { withReturn: false });
+          for (const f of found) record(f);
+        } catch (e) {
+          errors++;
+          lastError = e;
+        } finally {
+          done++;
+          passDone++;
+          emitProgress();
+        }
       }
     }
+    await Promise.all(Array.from({ length: Math.min(_concurrency(), taskList.length) }, worker));
+    return passDone;
   }
 
-  const workers = [];
-  const n = Math.min(_concurrency(), tasks.length);
-  for (let i = 0; i < n; i++) workers.push(worker());
-  await Promise.all(workers);
+  // Keep the progress line (and the "waiting for reader quota" hint) ticking
+  // even while every worker is parked on the rate limiter.
+  const heartbeat = typeof setInterval === "function" ? setInterval(emitProgress, 2000) : null;
+  const stopHeartbeat = () => { if (heartbeat) clearInterval(heartbeat); };
+
+  await runPass(broadTasks.concat(ojTasks), "routes");
 
   if (done > 0 && all.length === 0 && errors === done && lastError) {
+    stopHeartbeat();
     throw lastError; // every single lookup failed — surface the real reason
+  }
+
+  // ---- pass 2: deep sweep of the remaining days for the cheapest routes ----
+  let deepPairList = [];
+  if (thorough && !stopped && fullGrid > lookupCeiling) {
+    // Cheapest price seen per route (pair + stay) in pass 1.
+    const routePrice = new Map();
+    for (const f of all) {
+      if (f.open_jaw || f.price == null) continue;
+      const k = routeKey(f.origin_airport, f.dest_airport, f.stay_days);
+      if (!routePrice.has(k) || f.price < routePrice.get(k)) routePrice.set(k, f.price);
+    }
+    // Rank airport PAIRS by their best price, so every stay length of the most
+    // promising route gets its calendar swept (not just one stay).
+    const pairPrice = new Map();
+    for (const [k, price] of routePrice) {
+      const pk = k.split("|").slice(0, 2).join("|");
+      if (!pairPrice.has(pk) || price < pairPrice.get(pk)) pairPrice.set(pk, price);
+    }
+    const rankedPairs = routePairs.slice().sort((a, b) => {
+      const pa = pairPrice.has(a.join("|")) ? pairPrice.get(a.join("|")) : Infinity;
+      const pb = pairPrice.has(b.join("|")) ? pairPrice.get(b.join("|")) : Infinity;
+      return pa - pb;
+    });
+
+    // Fill in the days the broad pass skipped, cheapest route first, until the
+    // lookup ceiling is reached. A route whose whole remaining calendar fits
+    // gets it; otherwise it gets ~80% of what is left and the next route gets
+    // a share too, so one badly-ranked route can't swallow the budget.
+    // Missing days are visited in bisection order (the middle of the window
+    // first, then the middles of the halves, …) so that partial coverage is
+    // spread evenly instead of leaving a whole month-end unchecked.
+    const missing = bisectionOrder(allDates.filter((d) => !broadDates.includes(d)));
+    const deepTasks = [];
+    const deepPairs = new Map();
+    let room = lookupCeiling - broadTasks.length - ojTasks.length;
+    for (const pair of rankedPairs) {
+      if (room <= 0) break;
+      const deficit = missing.length * stayLengths.length;
+      const reserve = rankedPairs.length > 1 ? Math.ceil(room * 0.2) : 0;
+      let share = room - reserve >= deficit ? deficit : Math.max(stayLengths.length, Math.ceil((room - reserve) * 0.8));
+      share = Math.min(share, room);
+      const pk = pair.join("|");
+      let spent = 0;
+      const days = new Set();
+      for (const outbound of missing) {
+        if (share < stayLengths.length) break; // only ever take whole days
+        for (const stay of stayLengths) {
+          if (room <= 0) break;
+          deepTasks.push(rtTask(pair[0], pair[1], outbound, stay));
+          share--;
+          room--;
+          spent++;
+          days.add(outbound);
+        }
+      }
+      if (spent) deepPairs.set(pk, { lookups: spent, dates: days.size + broadDates.length });
+    }
+    deepPairList = Array.from(deepPairs.entries())
+      .map(([k, v]) => `${k.split("|").join("→")} (${v.dates} days)`);
+    if (deepTasks.length) {
+      planned.deep = deepTasks.length;
+      await runPass(deepTasks, "every day");
+    }
   }
 
   all.sort((a, b) => (a.price ?? 1e9) - (b.price ?? 1e9));
@@ -1002,6 +1223,35 @@ async function runSearch(params, onProgress) {
     return (x.has_flights ? 0 : 1) - (y.has_flights ? 0 : 1) || px - py;
   });
 
+  // ---- returns: one fetch per (route, return date), only for what we display ----
+  // Return lookups share the reader quota with the date sweep, so the list is
+  // ordered by importance and cut off at window.RETURN_FETCH_LIMIT.
+  const displaySet = [];
+  const seenFlights = new Set();
+  const addDisplay = (f) => { if (f && !seenFlights.has(f)) { seenFlights.add(f); displaySet.push(f); } };
+  addDisplay(directs[0]);
+  addDisplay(connecting[0]);
+  all.slice(0, 12).forEach(addDisplay);        // the ranked list people actually read
+  perOriginList.forEach((r) => addDisplay(r.cheapest_any));
+  perDateList.forEach((r) => addDisplay(r.cheapest));
+  all.slice(12, 50).forEach(addDisplay);
+  const returnPlan = await attachReturnsToDisplay(displaySet, currency, (p) => {
+    currentPhase = "returns";
+    if (onProgress) onProgress({ phase: "returns", done: p.done, total: p.total, found: all.length, errors });
+  }, returnLimit);
+  planned.returns = returnPlan.requested;
+  stopHeartbeat();
+
+  // Which dates were fully swept (every route) vs only partially?
+  const datesChecked = Array.from(new Set(all.map((f) => f.outbound_date).filter(Boolean))).sort();
+  const allRouteList = [];
+  for (const pair of routePairs) for (const stay of stayLengths) allRouteList.push([pair[0], pair[1], stay]);
+  let fullySweptRoutes = 0;
+  for (const [o, d, s] of allRouteList) {
+    const covered = allDates.every((dt) => sweptKeys.has(sweepKey(o, d, s, dt)));
+    if (covered) fullySweptRoutes++;
+  }
+
   return {
     origin_input: params.origin,
     destination_input: params.destination,
@@ -1011,19 +1261,26 @@ async function runSearch(params, onProgress) {
     date_to: isoLocal(end),
     min_days: minDays,
     max_days: maxDays,
-    sample_outbounds: datesUsed,
+    sample_outbounds: datesChecked,
     currency,
     direct_only: !!params.direct_only,
     searches_performed: done,
     lookup_errors: errors,
-    stopped_early: stopped || done < tasks.length,
+    stopped_early: stopped || done < planned.sweep + planned.deep,
     // Exactly what this search covered — so partial coverage is never silent.
     pairs_available: pairs.length,
-    pairs_searched: nPairs,
-    dates_checked: datesUsed.length,
+    pairs_searched: routePairs.length,
+    dates_checked: datesChecked.length,
     dates_in_window: windowDays,
-    stays_checked: staysUsed.length,
+    stays_checked: stayLengths.length,
     stays_requested: stayLengths.length,
+    routes_available: pairs.length * stayLengths.length,
+    routes_fully_swept: fullySweptRoutes,
+    routes_deep: deepPairList.length,
+    deep_pairs: deepPairList,
+    return_fetches: planned.returns,
+    returns_truncated: !!returnPlan.capped,
+    reader_rate_per_minute: _readerRate(),
     cheapest_direct: directs[0] || null,
     cheapest_with_stops: connecting[0] || null,
     ranked_options: all.slice(0, 50),
@@ -1034,12 +1291,17 @@ async function runSearch(params, onProgress) {
       "Live Google Flights prices, fetched and parsed entirely in your browser — no backend, no API key. " +
       "All of Google's itinerary lists (nonstop and connecting) are parsed, so the cheapest option is included. " +
       "Country inputs expand to that country's commercial airports, and every resolved airport pair is searched; " +
-      "you can also list airports directly (e.g. \"DUS, FRA, HAM\"). The date window is capped at 31 days: " +
-      "use \"Every day in window\" for full date coverage on a single route, or \"Sampled days\" to spread a few " +
-      "days across it (the results always state how many pairs/dates/stays were covered). Lookups are capped " +
-      "(⚙️ settings); the cap is treated as a floor when more airports still need covering. " +
+      "you can also list airports directly (e.g. \"DUS, FRA, HAM\"). The date window is capped at 31 days. " +
+      "\"Every day in window\" spreads the lookup budget over the whole window in two passes: a first pass checks " +
+      "every route on a few spread-out days, then a second pass fills in more days for the routes that looked " +
+      "cheapest, visiting the missing days in bisection order so no stretch of the calendar is left unchecked. " +
+      "\"Sampled days\" stops after the first pass (faster). The header always states exactly how many pairs, days " +
+      "and stay lengths were covered, so partial coverage is never silent. The key-less reader serves about " +
+      `${_readerRate()} lookups a minute per visitor; lookups are queued under that rate (the progress line shows ` +
+      "any wait), so a large sweep takes a few minutes. A free reader API key in ⚙️ settings removes the wait. " +
       "Round-trip prices are Google's own totals; Google's round-trip page lists only the outbound itinerary, " +
-      "so the return flight shown is the cheapest return on that date (same airline when available), fetched separately. " +
+      "so the return flight shown is the cheapest return on that date (same airline when available), fetched " +
+      `separately for the flights on display (up to ${returnLimit}). ` +
       (params.direct_only ? "Only nonstop itineraries were requested. " : "") +
       "Open-jaw totals are estimated from two separate one-ways.",
   };
@@ -1152,8 +1414,14 @@ function renderResults(data) {
     <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
     <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days</span>
     ${data.direct_only ? `<span>Direct (nonstop) only</span>` : ""}
-    <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? " · partial (limit reached)" : ""}</span>
+    <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? " · partial (time limit)" : ""}</span>
     ${data.pairs_available ? `<span>Coverage: <strong>${data.pairs_searched}/${data.pairs_available}</strong> airport pairs · <strong>${data.dates_checked}/${data.dates_in_window}</strong> dates · <strong>${data.stays_checked}/${data.stays_requested}</strong> stay lengths</span>` : ""}
+    <span>Return details loaded for <strong>${data.return_fetches || 0}</strong> flight${(data.return_fetches || 0) === 1 ? "" : "s"}; each one is a separate reader lookup, so rows beyond that show the return date only${data.returns_truncated ? " (raise the ceiling in ⚙️ to load more)" : ""}</span>
+    ${data.routes_fully_swept
+      ? `<span>Every day of the window swept for <strong>${data.routes_fully_swept}</strong> of <strong>${data.routes_available}</strong> routes</span>`
+      : (data.deep_pairs && data.deep_pairs.length
+        ? `<span>Deeper calendar sweep for the cheapest routes: <strong>${data.deep_pairs.slice(0, 6).join(" · ")}</strong></span>`
+        : "")}
   `;
 
   const cur = data.currency || window._currency || "";
@@ -1274,7 +1542,7 @@ function loadSettings() {
   try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch (e) {}
   $("readerUrl").value = s.readerUrl || window.FLIGHT_READER || "https://r.jina.ai/";
   $("readerKey").value = s.readerKey || window.FLIGHT_READER_KEY || "";
-  $("maxSearches").value = s.maxSearches || window.MAX_SEARCHES || 12;
+  $("maxSearches").value = s.maxSearches || window.MAX_SEARCHES || 200;
   const hosts = s.googleHosts || (window.FLIGHT_GOOGLE_HOSTS || []);
   $("googleHosts").value = Array.isArray(hosts) ? hosts.join(", ") : String(hosts || "");
 }
@@ -1283,7 +1551,7 @@ function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({
       readerUrl: $("readerUrl").value.trim(),
       readerKey: $("readerKey").value.trim(),
-      maxSearches: parseInt($("maxSearches").value, 10) || window.MAX_SEARCHES || 12,
+      maxSearches: parseInt($("maxSearches").value, 10) || window.MAX_SEARCHES || 200,
       googleHosts: $("googleHosts").value.trim(),
     }));
   } catch (e) {}
@@ -1332,9 +1600,20 @@ function wire() {
 
     try {
       const data = await runSearch(params, (p) => {
+        const label = p.phase === "returns" ? "Loading return flights"
+          : p.phase === "every day" ? "Sweeping more dates"
+          : "Searching airports";
+        const secs = Math.round((p.elapsedMs || 0) / 1000);
+        const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+        const waiting = p.throttleMs && p.throttleMs > 1000
+          ? ` · waiting for the free reader's quota (${Math.ceil(p.throttleMs / 1000)}s) — a free reader key in ⚙️ removes this wait`
+          : "";
+        const eta = p.phase !== "returns" && p.total
+          ? ` · up to ~${p.etaMinutes || 1} min on the free reader`
+          : "";
         $("progress").textContent =
-          `Searching… ${p.done}/${p.total} lookups · ${p.found} options found` +
-          (p.errors ? ` · ${p.errors} failed` : "");
+          `${label}… ${p.done}/${p.total} lookups [${clock}] · ${p.found} options found` +
+          (p.errors ? ` · ${p.errors} failed` : "") + waiting + eta;
       });
       renderResults(data);
       $("results").style.display = "block";

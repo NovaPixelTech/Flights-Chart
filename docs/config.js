@@ -32,12 +32,28 @@ window.FLIGHT_GOOGLE_HOSTS = [
   "www.google.com",
 ];
 
-// Hard cap on how many route/date lookups a single search performs.
-// Each lookup is one reader request, so keep this modest on the free tier.
-window.MAX_SEARCHES = 12;
+// Lookup ceiling for a single search. This is how many route/date lookups the
+// sweep may perform. It is treated as a FLOOR when more airports still need
+// covering (every resolved airport pair is always attempted), and as a ceiling
+// for deep calendar sweeps. Each lookup is one reader request, so a big
+// multi-airport "every day" search does take a while — see
+// READER_MAX_PER_MINUTE below. Raise it for more exhaustive date coverage,
+// lower it to be quick.
+window.MAX_SEARCHES = 80;
 
 // How many reader requests may run at once (be polite to the free service).
 window.SEARCH_CONCURRENCY = 3;
 
-// Give up on a search after this many milliseconds (returns partial results).
-window.SEARCH_TIME_BUDGET_MS = 90000;
+// The key-less reader serves roughly 20 lookups per rolling minute per visitor
+// and answers HTTP 429 beyond that (one lookup = one rendered Google Flights
+// page). Requests are queued to stay under this rate instead of failing, so a
+// 80-lookup sweep takes about 4–5 minutes. A free reader API key lifts the
+// limit; see the ⚙️ settings panel.
+window.READER_MAX_PER_MINUTE = 18;
+
+// How many return-direction lookups to fetch for the displayed flights. Each
+// one is a reader request, so this competes with the date sweep for quota.
+window.RETURN_FETCH_LIMIT = 16;
+
+// Hard stop for a search (partial results are returned instead).
+window.SEARCH_TIME_BUDGET_MS = 900000;
