@@ -300,7 +300,7 @@ async function fetchGoogleFlightsHtml(tfs, currency, timeoutMs = 70000) {
   const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
   const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
-    const res = await fetch(url, { headers, signal: ctrl && ctrl.signal, redirect: "follow" });
+    const res = await fetch(url, { headers, signal: ctrl && ctrl.signal, redirect: "follow", cache: "no-store" });
     if (!res.ok) {
       const err = new Error(
         res.status === 429
@@ -502,6 +502,16 @@ function parseISODate(s) {
   if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
   return new Date(parts[0], parts[1] - 1, parts[2]);
 }
+/** `count` evenly-spaced ISO dates across [start, end] (inclusive). */
+function spreadDates(start, end, count) {
+  const span = Math.round((end - start) / MS_DAY);
+  if (count <= 1 || span <= 0) return [isoLocal(start)];
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push(isoLocal(addDays(start, Math.round((i * span) / (count - 1)))));
+  }
+  return Array.from(new Set(out));
+}
 
 /* ------------------------------------------------------------------ *
  *  Search orchestration
@@ -630,18 +640,38 @@ async function runSearch(params, onProgress) {
   const currency = params.currency || "USD";
   const maxSearches = currentMaxSearches();
 
-  // ---- build the task list (priority: date → stay → origin → destination) ----
+  // ---- spend the (limited) lookup budget wisely ----
+  // Country inputs expand to many airports, so we divide the budget between
+  // "how many dates to sample" and "how many airport pairs to try" instead of
+  // dumping the whole budget onto the first sampled date.
+  const pairs = [];
+  for (const o of orgs) for (const d of dsts) if (o !== d) pairs.push([o, d]);
+
+  let nDates = Math.min(sampleOutbounds.length, 6);
+  let nPairs = Math.min(pairs.length, (isCountryOrigin || isCountryDest) ? 6 : 3);
+  let nStays = stayLengths.length;
+
+  while (nDates * nPairs * nStays > maxSearches && nStays > 1) nStays--;
+  while (nDates * nPairs * nStays > maxSearches) {
+    if (nDates >= nPairs && nDates > 1) nDates--;
+    else if (nPairs > 1) nPairs--;
+    else break;
+  }
+
+  const datesUsed = spreadDates(start, end, nDates);
+  const staysUsed = stayLengths.slice(0, Math.max(1, nStays));
+
+  // ---- build the task list: airport pair → date → stay ----
   const tasks = [];
   outer:
-  for (const outbound of sampleOutbounds) {
-    for (const stay of stayLengths) {
-      const ret = isoLocal(addDays(parseISODate(outbound), stay));
-      for (const o of orgs) {
-        for (const d of dsts) {
-          if (o === d) continue;
-          tasks.push({ kind: "rt", origin: o, dest: d, outbound, ret, stay });
-          if (tasks.length >= maxSearches) break outer;
-        }
+  for (const pair of pairs.slice(0, nPairs)) {
+    for (const outbound of datesUsed) {
+      for (const stay of staysUsed) {
+        tasks.push({
+          kind: "rt", origin: pair[0], dest: pair[1], outbound,
+          ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
+        });
+        if (tasks.length >= maxSearches) break outer;
       }
     }
   }
@@ -649,8 +679,8 @@ async function runSearch(params, onProgress) {
   // ---- optional open-jaw tasks (different return airport) ----
   if (params.open_jaw && orgs.length > 1 && tasks.length < maxSearches) {
     const top = orgs.slice(0, 5);
-    const ob = sampleOutbounds[0];
-    const stay = stayLengths[0];
+    const ob = datesUsed[0];
+    const stay = staysUsed[0];
     const ret = isoLocal(addDays(parseISODate(ob), stay));
     outer2:
     for (const oOut of top) {
@@ -722,6 +752,18 @@ async function runSearch(params, onProgress) {
   const directs = all.filter((r) => !r.open_jaw && r.stops === 0);
   const connecting = all.filter((r) => r.stops > 0 || r.open_jaw);
 
+  // cheapest option found for each outbound date we actually queried
+  const perDate = {};
+  for (const f of all) {
+    const k = f.outbound_date;
+    if (!k) continue;
+    if (!perDate[k] || (f.price != null && (perDate[k].price == null || f.price < perDate[k].price))) {
+      perDate[k] = f;
+    }
+  }
+  const perDateList = Object.keys(perDate).sort()
+    .map((d) => ({ date: d, cheapest: perDate[d] }));
+
   const perOriginList = orgs.map((o) => ({
     airport: airportInfo(o),
     cheapest_any: perOrigin[o].any,
@@ -743,7 +785,7 @@ async function runSearch(params, onProgress) {
     date_to: isoLocal(end),
     min_days: minDays,
     max_days: maxDays,
-    sample_outbounds: sampleOutbounds,
+    sample_outbounds: datesUsed,
     currency,
     searches_performed: done,
     lookup_errors: errors,
@@ -751,12 +793,14 @@ async function runSearch(params, onProgress) {
     cheapest_direct: directs[0] || null,
     cheapest_with_stops: connecting[0] || null,
     ranked_options: all.slice(0, 15),
+    per_date_summary: perDateList,
     per_origin_summary: perOriginList,
     all_results_count: all.length,
     note:
       "Live Google Flights prices, fetched and parsed entirely in your browser — no backend, no API key. " +
       "Country inputs expand to that country's commercial airports. The date window is capped at 31 days and " +
-      "sampled (not every single day), and the number of lookups is capped (⚙️ settings) to respect the free reader. " +
+      "sampled (not every single day) — see the date breakdown — and the number of lookups is capped (⚙️ settings) " +
+      "to respect the free reader, so the budget is split between dates and airports. " +
       "Round-trip prices are Google's own totals; the itinerary shown is the outbound (Google pairs the return automatically). " +
       "Open-jaw totals are estimated from two separate one-ways.",
   };
@@ -850,6 +894,27 @@ function renderResults(data) {
     html += `</tbody></table></div>`;
   } else {
     html += `<div class="flight-card"><div class="empty">No flights found in the sampled dates/airports. Try a different route, wider window, or fewer constraints.</div></div>`;
+  }
+
+  const dateRows = data.per_date_summary || [];
+  if (dateRows.length > 1) {
+    html += `<div class="section-title">Cheapest by departure date (sampled across your window)</div>`;
+    html += `<div class="results-table-wrap"><table class="results-table"><thead><tr>
+      <th>Outbound date</th><th>Cheapest</th><th>From → To</th><th>Stops</th><th>Airlines</th><th>Out times</th>
+    </tr></thead><tbody>`;
+    dateRows.forEach((row) => {
+      const f = row.cheapest;
+      const t = _legTimes(f);
+      html += `<tr>
+        <td><strong>${fmtDate(row.date)}</strong></td>
+        <td class="price-cell">${f.price != null ? f.price + " " + cur : "—"}</td>
+        <td>${f.origin_airport || "—"} → ${f.dest_airport || "—"}</td>
+        <td>${f.stops === 0 ? "Direct" : (f.stops || 0) + " stop(s)"}</td>
+        <td>${(f.airlines || []).join(", ") || "—"}</td>
+        <td>${t.outDep}→${t.outArr}</td>
+      </tr>`;
+    });
+    html += `</tbody></table></div>`;
   }
 
   if (data.per_origin_summary && data.per_origin_summary.length) {
