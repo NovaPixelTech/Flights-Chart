@@ -8,6 +8,12 @@ ranges, open-jaw (different return airport), and an optional **direct-only (nons
 Every result lists the **outbound and the return** flight (airport, `dd.mm.yyyy` date, times,
 airline) plus the number of stay days.
 
+By default a search is **exhaustive**: every resolved airport pair, every stay length and **every
+single day** of the date window is queried, so the cheapest option reported really is the cheapest
+on offer — no sampling that could step over the cheap Sunday. That takes a while on the free
+reader (the progress line shows an ETA, a **Stop** button ends it early, and an interrupted run can
+be **resumed** after a reload); a free reader API key removes the wait.
+
 **Live flight prices. Completely static. No backend, no accounts, no API keys, no credit card.**
 It runs entirely in the browser on GitHub Pages.
 
@@ -50,8 +56,14 @@ Everything runs in `docs/app.js`. It is a self-contained JavaScript port of the
   per visitor and answers `HTTP 429` beyond that (one lookup = one rendered Google Flights page).
   Instead of firing until it breaks, every reader request is admitted through a rolling-window
   queue (`READER_MAX_PER_MINUTE`, default 18/min) and a `429` adds a short penalty and is retried
-  with patience, so a big sweep finishes instead of failing. The progress line shows the wait and
-  the estimated time; a free reader API key removes the wait almost entirely.
+  with patience, so a big sweep finishes instead of failing. The progress line shows the wait, the
+  elapsed time, the plan and the estimated total; a free reader API key removes the wait almost
+  entirely.
+- **Long runs are survivable** — an exhaustive sweep can run for a long time, so results are
+  checkpointed to `localStorage` as they arrive and offered back after a reload (**Resume**,
+  which re-runs only the unfinished lookups and restores what was already found). A **Stop**
+  button ends a run at any time and renders the partial results. Sweep lookups are also cached in
+  memory, so re-running a search never pays the reader twice for the same lookup.
 
 > **No secret is embedded and nothing is exposed.** The reader request and the (already
 > public) Google Flights page are the only network calls.
@@ -78,11 +90,12 @@ Your site is live at `https://<user>.github.io/<repo>/`.
 | `FLIGHT_READER` | `https://r.jina.ai/` | The reader/fetcher prefix. |
 | `FLIGHT_READER_KEY` | `""` | Optional reader API key — only **raises rate limits**; never required. |
 | `FLIGHT_GOOGLE_HOSTS` | `["www.google.co.uk", "www.google.ca", …]` | Google domains tried in order until real flight data is returned. |
-| `MAX_SEARCHES` | `80` | Lookup ceiling per search (each lookup = one reader request). It is treated as a **floor** when more airport pairs still need covering, so a country search never silently drops airports, and as the budget for the deeper date sweep. Hard cap: 400. |
+| `MAX_SEARCHES` | `0` (exhaustive) | Lookup ceiling per search (each lookup = one reader request and covers one airport pair × one stay length × one calendar day). **`0` means exhaustive**: every airport pair, every stay length and **every day** of the window is swept, so the reported cheapest option really is the cheapest on offer — time is not a shortcut. A positive value caps the sweep; airport pairs and stay lengths are still always all covered (the cap is a **floor** for coverage), and the remaining budget goes to calendar days, spread evenly across the window. Hard cap: 50000. |
+| `MAX_SEARCHES_SAFETY` | `1500` | Hard ceiling applied in exhaustive mode, so a pathological grid (whole country → whole country, month-long, wide stay range) can't queue tens of thousands of requests. When it bites, the result header says exactly what was covered and how to raise it. |
 | `READER_MAX_PER_MINUTE` | `18` | How many reader lookups may be admitted per rolling minute. The key-less reader starts answering `HTTP 429` somewhere above 20, so requests are queued under this rate instead of being sent and failing. |
-| `RETURN_FETCH_LIMIT` | `16` | Minimum number of return-direction lookups spent on the displayed flights. It grows with `MAX_SEARCHES` (up to a quarter of it), since return lookups share the same per-minute quota as the date sweep. |
+| `RETURN_FETCH_LIMIT` | `16` | Minimum number of return-direction lookups spent on the displayed flights. It grows with the lookup ceiling (up to a fifth of it, max 200), since return lookups share the same per-minute quota as the date sweep. |
 | `SEARCH_CONCURRENCY` | `3` | How many reader requests may be in flight at once (the rate limiter still paces them). |
-| `SEARCH_TIME_BUDGET_MS` | `900000` | Hard stop: show partial results after this long. |
+| `SEARCH_TIME_BUDGET_MS` | `0` | Hard stop for a search in milliseconds. **`0` = no time limit** (only the Stop button ends a run); partial results are shown either way. |
 
 Visitors can override the reader, add their own key, or change the lookup cap from the in-page
 **⚙️ Data source settings** panel (saved in their browser only).
@@ -108,23 +121,24 @@ python -m http.server 8000 --directory docs
   when it isn't the country's main hub. Multiple airports/cities can also be listed directly
   (`DUS, FRA, HAM`, `DUS FRA HAM`, `Frankfurt, Munich`). Cities that have several hubs (London,
   Paris, New York, …) expand to all of them.
-- **Sampled dates, honest reporting.** The free reader's ~20 lookups/minute makes a full
-  day-by-day sweep of a multi-airport month impossible, so the lookup budget is spent in two
-  passes, in priority order (airport pairs → stay lengths → calendar days):
-  1. **Broad pass** — *every* route (airport pair × stay length) is looked up on a few
-     spread-out days of the window, so no airport and no stay length is ever skipped.
-  2. **Deep pass** — the routes that looked cheapest get more days. A route whose whole
-     remaining calendar fits in the leftover budget gets **every day**; otherwise it gets a
-     share and so do the next-cheapest routes, so one badly-ranked route can't swallow the
-     budget. Missing days are visited in **bisection order** (the middle of the window first,
-     then the middles of the halves, …), so partial coverage is spread evenly and no stretch of
-     the calendar is left unchecked.
-  "Sampled days" stops after the broad pass (faster). The result header always states exactly
-  what was covered (`Coverage: N/M airport pairs · N/M dates · N/M stay lengths`, plus which
-  routes had every day swept), the per-airport table marks airports that weren't checked, and
-  raising the lookup budget in ⚙️ settings buys more date coverage. Expect a 10-airport,
-  month-long "every day" search to take **4–6 minutes** key-less (~80 lookups + ~16 return
-  lookups at 18/minute); paste a free reader API key to make it much faster.
+- **Accuracy first: the whole grid, by default.** One *route* = an airport pair × a stay length;
+  one *lookup* = a route on one calendar day. With the default ceiling (`0`) the app sweeps the
+  **entire grid** — every pair, every stay length, **every day** of the window — so the cheapest
+  option it reports really is the cheapest on offer. For the reference case (5 German airports →
+  ATH/SKG, 2 stay lengths, December) that is 620 lookups ≈ **35–40 minutes** key-less; keep the
+  tab open (progress is checkpointed and a reload offers to **resume**, skipping finished
+  lookups). "**Sampled days**" is the explicit fast path: 4 spread-out days, no deep pass.
+  If the grid is bigger than the budget (a positive ceiling, or the `MAX_SEARCHES_SAFETY` cap),
+  coverage is trimmed **in calendar days only** — never airport pairs or stay lengths — and the
+  priority order is: (1) **broad pass** over every route on spread-out days, then (2) **deep
+  pass** over the remaining days for the routes that looked cheapest (a route whose whole
+  remaining calendar fits gets every day; otherwise it gets a share, so one badly-ranked route
+  can't swallow the budget; missing days are visited in **bisection order** so partial coverage
+  is spread evenly). The result header always states exactly what was covered
+  (`Coverage: N/M airport pairs · N/M dates · N/M stay lengths`), and when everything fitted it
+  states that the sweep was **exhaustive** and that the cheapest option listed is the cheapest on
+  offer. Raise the lookup budget in ⚙️ settings to cover more; paste a free reader API key to
+  make any of it much faster.
 - **Round-trip detail.** Google's round-trip page returns its round-trip total price but lists
   only the **outbound** itinerary. The app therefore fetches the **return direction separately**
   (one extra lookup per return date, de-duplicated) and shows the cheapest return on that date

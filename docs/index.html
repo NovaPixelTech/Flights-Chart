@@ -49,8 +49,8 @@
           <div>
             <label for="date_mode">Date coverage</label>
             <select id="date_mode" name="date_mode">
-              <option value="every">Every day in window (most accurate — extra days swept for the cheapest routes)</option>
-              <option value="sampled">Sampled days (faster — may miss some dates)</option>
+              <option value="every">Every day in window — exhaustive (most accurate, slowest)</option>
+              <option value="sampled">Sampled days (fast — may miss cheap dates)</option>
             </select>
           </div>
           <div>
@@ -78,10 +78,13 @@
             </label>
           </div>
         </div>
-        <button type="submit" class="btn" id="submitBtn">
-          <span id="btnText">Search cheapest flights</span>
-          <span id="btnSpin" class="spinner" style="display:none"></span>
-        </button>
+        <div class="actions">
+          <button type="submit" class="btn" id="submitBtn">
+            <span id="btnText">Search cheapest flights</span>
+            <span id="btnSpin" class="spinner" style="display:none"></span>
+          </button>
+          <button type="button" class="btn btn-stop" id="stopBtn" style="display:none">Stop &amp; show results</button>
+        </div>
         <div id="progress" class="progress" style="display:none"></div>
       </form>
 
@@ -92,8 +95,8 @@
           <input id="readerUrl" placeholder="https://r.jina.ai/" autocomplete="off" spellcheck="false" />
           <label for="readerKey">Reader API key (optional — raises the lookup rate limit)</label>
           <input id="readerKey" placeholder="leave blank to stay key-less" autocomplete="off" spellcheck="false" />
-          <label for="maxSearches">Lookup ceiling per search (higher = more dates swept per route; slower)</label>
-          <input id="maxSearches" type="number" min="1" max="400" />
+          <label for="maxSearches">Lookup ceiling per search (0 = exhaustive: every date × every stay length × every airport pair)</label>
+          <input id="maxSearches" type="number" min="0" max="20000" placeholder="0 = exhaustive" />
           <label for="googleHosts">Google domains to try (comma-separated, in order)</label>
           <input id="googleHosts" placeholder="www.google.co.uk, www.google.ca, www.google.com" autocomplete="off" spellcheck="false" />
           <p class="hint">
@@ -103,15 +106,29 @@
             automatically tries the next one in the list. Settings are saved in <em>your</em> browser only.
           </p>
           <p class="hint">
-            <strong>Why a big search takes a few minutes:</strong> the key-less reader serves roughly
+            <strong>Accuracy first.</strong> The app defaults to an <strong>exhaustive</strong> search: every airport
+            pair, every stay length and <strong>every single day</strong> of the date window is looked up, so the
+            cheapest option it reports really is the cheapest on offer. Time is not a shortcut here — a
+            5-airport month-long sweep is ~620 lookups ≈ 35 minutes key-less. Keep this tab open while it runs;
+            progress is checkpointed and a reload offers to resume.
+          </p>
+          <p class="hint">
+            <strong>Why a big search takes a while:</strong> the key-less reader serves roughly
             <strong>20 lookups per minute</strong> per visitor (one lookup = one Google&nbsp;Flights page),
-            and answers <em>HTTP&nbsp;429</em> past that. Rather than failing, the app now queues its
-            lookups under that rate and shows the wait in the progress line — a 80-lookup sweep lands
-            around 4–5 minutes. A <strong>free reader API key</strong> lifts the limit, so paste one here
-            if you want to sweep big airport sets (or raise the ceiling) quickly.
+            and answers <em>HTTP&nbsp;429</em> past that. Rather than failing, the app queues its
+            lookups under that rate and shows the wait, the elapsed time and an ETA in the progress line.
+            A <strong>free reader API key</strong> lifts the limit, so paste one here if you want to sweep big
+            airport sets quickly. Setting the ceiling above 0 caps the sweep (calendar days are spread across
+            the window and the result header states exactly what was covered); <strong>0 means exhaustive</strong>.
           </p>
         </div>
       </details>
+    </div>
+
+    <div id="resumeBox" class="resume-box" style="display:none">
+      <span id="resumeText"></span>
+      <button type="button" class="btn-mini" id="resumeBtn">Resume search</button>
+      <button type="button" class="btn-mini ghost" id="resumeDiscard">Discard</button>
     </div>
 
     <div id="errorBox" class="error" style="display:none"></div>

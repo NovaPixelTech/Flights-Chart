@@ -320,9 +320,14 @@ function currentReaderKey() {
 }
 
 function currentMaxSearches() {
-  const typed = parseInt(($("maxSearches") && $("maxSearches").value) || "", 10);
-  const val = Number.isFinite(typed) && typed > 0 ? typed : (window.MAX_SEARCHES || 80);
-  return Math.max(1, Math.min(400, val));
+  const el = $("maxSearches");
+  const raw = el ? String(el.value).trim() : "";
+  const typed = parseInt(raw, 10);
+  // Blank or 0 means exhaustive: sweep every pair × stay length × calendar day.
+  if (raw === "" || raw === "0") return 0;
+  if (Number.isFinite(typed) && typed > 0) return Math.min(50000, typed);
+  const cfg = Number(window.MAX_SEARCHES);
+  return Number.isFinite(cfg) && cfg > 0 ? Math.min(50000, cfg) : 0;
 }
 
 function _concurrency() {
@@ -724,6 +729,31 @@ function bisectionOrder(dates) {
  * repeat (different outbound dates often share a return date) cost nothing. */
 const _oneWayCache = new Map();
 
+/* Outbound/round-trip sweep lookups are cached in memory too, so re-running a
+ * search (or continuing one) never pays the reader twice for the same
+ * airport pair × date × stay length. A long exhaustive sweep is ~600+ requests,
+ * so this matters. */
+const _routeCache = new Map();
+const ROUTE_CACHE_MAX = 6000;
+
+/* A long exhaustive sweep can outlive the tab, so progress is checkpointed in
+ * localStorage and can be resumed after a reload. */
+const RESUME_KEY = "flightschart.resume.v1";
+
+function readStoredRun() {
+  try {
+    const raw = window.localStorage && window.localStorage.getItem(RESUME_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || !data.params || !Array.isArray(data.done)) return null;
+    return data;
+  } catch (e) { return null; }
+}
+
+function clearStoredRun() {
+  try { if (window.localStorage) window.localStorage.removeItem(RESUME_KEY); } catch (e) { /* ignore */ }
+}
+
 async function fetchOneWayOptions(from, to, date, maxStops, currency) {
   const key = [from, to, date, maxStops, currency].join("|");
   if (_oneWayCache.has(key)) return _oneWayCache.get(key);
@@ -800,6 +830,9 @@ async function attachReturnsToDisplay(flights, currency, onProgress, limit) {
 async function searchOneRoute(task, currency, opts) {
   const withReturn = !opts || opts.withReturn !== false;
   const maxStops = task.maxStops != null ? task.maxStops : 2;
+  // Re-running a search should never pay the reader twice for the same lookup.
+  const cacheKey = [task.origin, task.dest, task.outbound, task.ret || "", maxStops, currency].join("|");
+  if (!withReturn && _routeCache.has(cacheKey)) return _routeCache.get(cacheKey);
   const legs = [{
     date: task.outbound, from: task.origin, to: task.dest, maxStops, maxLayover: 180,
   }];
@@ -836,6 +869,10 @@ async function searchOneRoute(task, currency, opts) {
     if (d.stops > 0 && d.layovers_min.some((l) => l > 180)) continue;
     if (returnOptions) attachReturnLeg(d, returnOptions, maxStops);
     out.push(d);
+  }
+  if (!withReturn) {
+    if (_routeCache.size >= ROUTE_CACHE_MAX) _routeCache.clear();
+    _routeCache.set(cacheKey, out);
   }
   return out;
 }
@@ -903,7 +940,8 @@ async function searchOpenJaw(task, currency) {
  * Run the whole search. `params` mirrors the old backend payload.
  * `onProgress` is called after every completed lookup so the UI can stream.
  */
-async function runSearch(params, onProgress) {
+async function runSearch(params, onProgress, opts) {
+  window._stopRequested = false;
   _oneWayCache.clear(); // always quote fresh prices for a new search
   const origins = resolveLocations(params.origin);
   const dests = resolveLocations(params.destination);
@@ -945,19 +983,19 @@ async function runSearch(params, onProgress) {
   for (let s = minDays; s <= maxDays; s++) stayLengths.push(s);
 
   const currency = params.currency || "USD";
-  const lookupCeiling = currentMaxSearches();
 
   // ---- plan the sweep ----
-  // One "route" = an origin→destination airport pair × a stay length. The full
-  // grid (routes × every calendar day) is far too many lookups for anything but
-  // a single route, so the sweep runs in two passes:
-  //   1. a broad pass over every route on a few spread-out days, then
-  //   2. a deep pass that sweeps EVERY remaining day for the routes that looked
-  //      cheapest in pass 1.
-  // Pass 2 is what catches a cheap date that an evenly spaced sample steps over
-  // (e.g. a Sun→Sun week that a "1st / 8th / 15th" sample would miss).
-  // Each sweep lookup is outbound-only (one fetch); return flights are fetched
-  // afterwards, once, and only for the flights that get displayed.
+  // One "route" = an origin→destination airport pair × a stay length; one
+  // "lookup" = a route on one calendar day (each lookup is a single reader
+  // request whose price is Google's round-trip total for that date pair).
+  //
+  // The default budget is EXHAUSTIVE: every pair × every stay length × every
+  // day in the window, so the reported cheapest option really is the cheapest
+  // on offer. Time is not a constraint — the reader rate limiter paces the
+  // sweep and the UI shows an ETA. Only when the grid is bigger than the safety
+  // cap (or when a positive ceiling is set in ⚙️) does coverage get trimmed,
+  // and then it is trimmed in calendar days (never airport pairs or stay
+  // lengths) and reported honestly in the result header.
   const pairs = [];
   for (const o of orgs) for (const d of dsts) if (o !== d) pairs.push([o, d]);
   if (!pairs.length) pairs.push([orgs[0], dsts[0]]); // same airport in and out
@@ -968,35 +1006,53 @@ async function runSearch(params, onProgress) {
   const allDates = [];
   for (let i = 0; i < windowDays; i++) allDates.push(isoLocal(addDays(start, i)));
 
-  let nPairs = pairs.length;
+  const requestedCeiling = currentMaxSearches(); // 0 = exhaustive
+  const exhaustive = !requestedCeiling;
+  const safetyCap = (() => {
+    const n = Number(window.MAX_SEARCHES_SAFETY);
+    return Number.isFinite(n) && n > 0 ? Math.min(50000, n) : 1500;
+  })();
+
   const nStays = stayLengths.length;
-  if (nPairs * nStays > lookupCeiling) {
-    nPairs = Math.max(1, Math.floor(lookupCeiling / nStays));
+  const pairsWanted = pairs.length;
+  let nPairs = pairsWanted;
+  // Keep as many airport pairs as fit; the cap is a floor for pair coverage, so
+  // it is only ever reduced when the pair list alone exceeds the whole budget.
+  if (nPairs * nStays > requestedCeiling && requestedCeiling > 0) {
+    nPairs = Math.max(1, Math.floor(requestedCeiling / nStays));
+  }
+  if (exhaustive && nPairs * nStays > safetyCap) {
+    nPairs = Math.max(1, Math.floor(safetyCap / nStays));
   }
   const routePairs = pairs.slice(0, nPairs);
   const routeCount = Math.max(1, routePairs.length * nStays);
 
-  // How many days the broad pass covers. "Every day in window" spends only part
-  // of the budget here so the deep pass can sweep whole calendars; "Sampled
-  // days" stops after the broad pass.
   const fullGrid = routeCount * windowDays;
+  const lookupCeiling = exhaustive
+    ? Math.max(1, Math.min(fullGrid, safetyCap))
+    : Math.max(1, Math.min(requestedCeiling, 50000));
+
+  // How many days the broad pass covers. With enough budget this is the whole
+  // window — i.e. the entire grid in a single exhaustive pass. "Sampled days"
+  // is the explicit fast path: a few spread-out days and no deep pass, whatever
+  // the budget.
+  const SAMPLED_DAYS = 4;
   let broadCount;
-  if (fullGrid <= lookupCeiling) {
-    broadCount = windowDays; // everything fits — one pass, every day
-  } else if (thorough) {
-    broadCount = Math.max(1, Math.min(windowDays, Math.floor((lookupCeiling * 0.4) / routeCount)));
+  const datesWeCanAfford = Math.max(1, Math.floor(lookupCeiling / routeCount));
+  if (!thorough) {
+    broadCount = Math.max(1, Math.min(windowDays, SAMPLED_DAYS));
+  } else if (fullGrid <= lookupCeiling) {
+    broadCount = windowDays; // everything fits — sweep every day, exhaustively
   } else {
-    broadCount = Math.max(1, Math.min(windowDays, Math.min(8, Math.floor((lookupCeiling * 0.5) / routeCount) || 1)));
+    broadCount = Math.max(1, Math.min(windowDays, datesWeCanAfford));
   }
   const broadDates = spreadDates(start, end, broadCount);
 
   const searchedOrigins = new Set();
-  const sweptKeys = new Set(); // "origin|dest|stay|date" — every lookup we actually ran
   const routeKey = (o, d, s) => `${o}|${d}|${s}`;
   const sweepKey = (o, d, s, date) => `${o}|${d}|${s}|${date}`;
   const rtTask = (origin, dest, outbound, stay) => {
     searchedOrigins.add(origin);
-    sweptKeys.add(sweepKey(origin, dest, stay, outbound));
     return {
       kind: "rt", origin, dest, outbound,
       ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
@@ -1004,10 +1060,24 @@ async function runSearch(params, onProgress) {
     };
   };
 
+  // ---- resume support: a long exhaustive sweep may outlive the tab ----
+  // Progress is checkpointed in localStorage, and a resumed run skips the
+  // lookups that already finished and restores their results.
+  const resume = (opts && opts.resume) || null;
+  const alreadyDone = new Set(resume && Array.isArray(resume.done) ? resume.done : []);
+  const finishedKeys = new Set(alreadyDone);
+  const taskId = (t) => (t.kind === "oj"
+    ? `oj|${t.o_out}|${t.o_ret}|${t.dest}|${t.outbound}|${t.stay}`
+    : sweepKey(t.origin, t.dest, t.stay, t.outbound));
+  const pendingOnly = (list) => (alreadyDone.size ? list.filter((t) => !alreadyDone.has(taskId(t))) : list);
+
   // ---- pass 1: broad grid, every route on the broad dates ----
+  // Ordered date-major from the middle of the window outwards, then by airport
+  // pair and stay length, so an interrupted sweep still has balanced coverage
+  // (every pair checked on the spread days) instead of one airport swallowed whole.
   const broadTasks = [];
-  for (const pair of routePairs) {
-    for (const outbound of broadDates) {
+  for (const outbound of bisectionOrder(broadDates.slice())) {
+    for (const pair of routePairs) {
       for (const stay of stayLengths) broadTasks.push(rtTask(pair[0], pair[1], outbound, stay));
     }
   }
@@ -1036,7 +1106,9 @@ async function runSearch(params, onProgress) {
     }
   }
 
-  const planned = { sweep: broadTasks.length + ojTasks.length, deep: 0, returns: 0 };
+  const broadPending = pendingOnly(broadTasks);
+  const ojPending = pendingOnly(ojTasks);
+  const planned = { sweep: broadPending.length + ojPending.length, deep: 0, returns: 0 };
 
   // ---- execute with a small worker pool ----
   const all = [];
@@ -1046,26 +1118,29 @@ async function runSearch(params, onProgress) {
   const startedAt = Date.now();
   const returnLimit = (() => {
     const base = Number(window.RETURN_FETCH_LIMIT);
-    const min = Number.isFinite(base) && base > 0 ? Math.min(80, base) : 16;
-    // Scale with the lookup ceiling so raising it in ⚙️ really does load more
-    // return details, but never spend more than a quarter of the budget here.
-    return Math.max(min, Math.ceil(lookupCeiling * 0.2));
+    const min = Number.isFinite(base) && base > 0 ? Math.min(120, base) : 16;
+    // Scale with the lookup ceiling so a bigger budget really does load more
+    // return details, but never spend more than a quarter of it here.
+    return Math.min(200, Math.max(min, Math.ceil(lookupCeiling * 0.2)));
   })();
   // Every lookup and every return fetch is one reader request, and the reader
   // allows ~_readerRate() of them a minute, so the wall-clock cost is the
-  // request count divided by that rate. Keep a generous ceiling on top.
+  // request count divided by that rate. SEARCH_TIME_BUDGET_MS=0 means "no time
+  // limit" — a long exhaustive sweep is meant to finish, not to be cut off.
   const requestedTotal = () =>
     (planned.sweep + planned.deep) + Math.min(returnLimit, planned.returns || returnLimit);
+  const configuredBudget = Number(window.SEARCH_TIME_BUDGET_MS);
+  const noTimeLimit = !Number.isFinite(configuredBudget) || configuredBudget <= 0;
   const timeBudgetMs = () =>
-    Math.max(
-      window.SEARCH_TIME_BUDGET_MS || 900000,
-      Math.ceil(requestedTotal() / _readerRate()) * 60000 + 120000
-    );
+    noTimeLimit
+      ? Infinity
+      : Math.max(configuredBudget, Math.ceil(requestedTotal() / _readerRate()) * 60000 + 120000);
   const estimateMinutes = () => Math.max(1, Math.ceil(requestedTotal() / _readerRate()));
   let done = 0;
   let errors = 0;
   let lastError = null;
   let stopped = false;
+  let stoppedByUser = false;
   let currentPhase = "routes";
 
   function emitProgress() {
@@ -1079,8 +1154,17 @@ async function runSearch(params, onProgress) {
       throttleMs: _readerThrottledMs(),
       elapsedMs: Date.now() - startedAt,
       etaMinutes: estimateMinutes(),
+      exhaustive,
+      gridTotal: fullGrid,
+      capped: fullGrid > lookupCeiling,
+      lookupCeiling,
     });
   }
+
+  // The reader is slow on purpose-friendly terms, so a big exhaustive sweep can
+  // run for a long time. Show the plan (and the estimate) before the first
+  // lookup, then keep the line ticking from the heartbeat.
+  emitProgress();
 
   function record(f) {
     all.push(f);
@@ -1094,19 +1178,60 @@ async function runSearch(params, onProgress) {
     }
   }
 
+  // Restore what an interrupted run had already found. Only keep options that
+  // still fit the parameters being run now (the form may have been edited).
+  let resumeDisabled = !(window.localStorage);
+  if (resume && Array.isArray(resume.options)) {
+    const orgSet = new Set(orgs);
+    const dstSet = new Set(dsts);
+    const firstDate = allDates[0];
+    const lastDate = allDates[allDates.length - 1];
+    for (const f of resume.options) {
+      if (!f || !f.origin_airport || !f.outbound_date) continue;
+      if (!orgSet.has(f.origin_airport) || !dstSet.has(f.dest_airport)) continue;
+      if (f.outbound_date < firstDate || f.outbound_date > lastDate) continue;
+      if (f.stay_days != null && (f.stay_days < minDays || f.stay_days > maxDays)) continue;
+      searchedOrigins.add(f.origin_airport);
+      record(f);
+    }
+  }
+
+  const CHECKPOINT_EVERY = 20;
+  let sinceCheckpoint = 0;
+  function checkpoint() {
+    if (resumeDisabled) return;
+    try {
+      window.localStorage.setItem(RESUME_KEY, JSON.stringify({
+        saved: Date.now(),
+        params,
+        done: Array.from(finishedKeys),
+        options: all,
+      }));
+    } catch (e) {
+      // Storage full or blocked — stop trying, but the search itself is fine.
+      resumeDisabled = true;
+    }
+  }
+
   async function runPass(taskList, label) {
     const queue = taskList.slice();
     let passDone = 0;
     currentPhase = label;
     async function worker() {
       while (queue.length) {
-        if (stopped || Date.now() - startedAt > timeBudgetMs()) { stopped = true; return; }
+        if (stopped || window._stopRequested || Date.now() - startedAt > timeBudgetMs()) {
+          if (window._stopRequested) stoppedByUser = true;
+          stopped = true;
+          return;
+        }
         const task = queue.shift();
         try {
           const found = task.kind === "oj"
             ? await searchOpenJaw(task, currency)
             : await searchOneRoute(task, currency, { withReturn: false });
           for (const f of found) record(f);
+          finishedKeys.add(taskId(task));
+          if (++sinceCheckpoint >= CHECKPOINT_EVERY) { sinceCheckpoint = 0; checkpoint(); }
         } catch (e) {
           errors++;
           lastError = e;
@@ -1126,9 +1251,9 @@ async function runSearch(params, onProgress) {
   const heartbeat = typeof setInterval === "function" ? setInterval(emitProgress, 2000) : null;
   const stopHeartbeat = () => { if (heartbeat) clearInterval(heartbeat); };
 
-  await runPass(broadTasks.concat(ojTasks), "routes");
+  await runPass(broadPending.concat(ojPending), "routes");
 
-  if (done > 0 && all.length === 0 && errors === done && lastError) {
+  if (!stopped && done > 0 && all.length === 0 && errors === done && lastError) {
     stopHeartbeat();
     throw lastError; // every single lookup failed — surface the real reason
   }
@@ -1191,9 +1316,10 @@ async function runSearch(params, onProgress) {
     }
     deepPairList = Array.from(deepPairs.entries())
       .map(([k, v]) => `${k.split("|").join("→")} (${v.dates} days)`);
-    if (deepTasks.length) {
-      planned.deep = deepTasks.length;
-      await runPass(deepTasks, "every day");
+    const deepPending = pendingOnly(deepTasks);
+    if (deepPending.length) {
+      planned.deep = deepPending.length;
+      await runPass(deepPending, "every day");
     }
   }
 
@@ -1241,19 +1367,40 @@ async function runSearch(params, onProgress) {
   const returnPlan = await attachReturnsToDisplay(displaySet, currency, (p) => {
     currentPhase = "returns";
     if (onProgress) onProgress({ phase: "returns", done: p.done, total: p.total, found: all.length, errors });
-  }, returnLimit);
+  }, stopped ? 0 : returnLimit);
   planned.returns = returnPlan.requested;
   stopHeartbeat();
+  // The run is done and its results are rendered, so the checkpoint can go.
+  clearStoredRun();
+  window._stopRequested = false;
 
-  // Which dates were fully swept (every route) vs only partially?
-  const datesChecked = Array.from(new Set(all.map((f) => f.outbound_date).filter(Boolean))).sort();
-  const allRouteList = [];
-  for (const pair of routePairs) for (const stay of stayLengths) allRouteList.push([pair[0], pair[1], stay]);
-  let fullySweptRoutes = 0;
-  for (const [o, d, s] of allRouteList) {
-    const covered = allDates.every((dt) => sweptKeys.has(sweepKey(o, d, s, dt)));
-    if (covered) fullySweptRoutes++;
+  // ---- what was ACTUALLY swept (planned vs finished differ when stopped) ----
+  // Every finished lookup contributes one key, "origin|dest|stay|date" for grid
+  // lookups ("oj|…" keys are open-jaw tasks, which are not part of the grid), so
+  // the reported coverage is measured, never claimed from the plan.
+  const sweptPairs = new Set();
+  const sweptStays = new Set();
+  const sweptDates = new Set();
+  const sweptRouteDates = new Map(); // "origin|dest|stay" -> Set(dates)
+  for (const k of finishedKeys) {
+    if (typeof k !== "string" || k.startsWith("oj|")) continue;
+    const [o, d, s, date] = k.split("|");
+    if (!date) continue;
+    sweptPairs.add(`${o}|${d}`);
+    sweptStays.add(s);
+    sweptDates.add(date);
+    const rk = `${o}|${d}|${s}`;
+    if (!sweptRouteDates.has(rk)) sweptRouteDates.set(rk, new Set());
+    sweptRouteDates.get(rk).add(date);
   }
+  let fullySweptRoutes = 0;
+  for (const pair of routePairs) {
+    for (const stay of stayLengths) {
+      const set = sweptRouteDates.get(routeKey(pair[0], pair[1], stay));
+      if (set && allDates.every((dt) => set.has(dt))) fullySweptRoutes++;
+    }
+  }
+  const datesChecked = Array.from(sweptDates).sort();
 
   return {
     origin_input: params.origin,
@@ -1270,13 +1417,18 @@ async function runSearch(params, onProgress) {
     searches_performed: done,
     lookup_errors: errors,
     stopped_early: stopped || done < planned.sweep + planned.deep,
+    stopped_by_user: stoppedByUser,
     // Exactly what this search covered — so partial coverage is never silent.
     pairs_available: pairs.length,
-    pairs_searched: routePairs.length,
+    pairs_searched: sweptPairs.size,
     dates_checked: datesChecked.length,
     dates_in_window: windowDays,
-    stays_checked: stayLengths.length,
+    stays_checked: sweptStays.size,
     stays_requested: stayLengths.length,
+    exhaustive,
+    grid_total: fullGrid,
+    lookup_ceiling: lookupCeiling,
+    safety_capped: fullGrid > lookupCeiling,
     routes_available: pairs.length * stayLengths.length,
     routes_fully_swept: fullySweptRoutes,
     routes_deep: deepPairList.length,
@@ -1295,16 +1447,23 @@ async function runSearch(params, onProgress) {
       "All of Google's itinerary lists (nonstop and connecting) are parsed, so the cheapest option is included. " +
       "Country inputs expand to that country's commercial airports, and every resolved airport pair is searched; " +
       "you can also list airports directly (e.g. \"DUS, FRA, HAM\"). The date window is capped at 31 days. " +
-      "\"Every day in window\" spreads the lookup budget over the whole window in two passes: a first pass checks " +
-      "every route on a few spread-out days, then a second pass fills in more days for the routes that looked " +
-      "cheapest, visiting the missing days in bisection order so no stretch of the calendar is left unchecked. " +
-      "\"Sampled days\" stops after the first pass (faster). The header always states exactly how many pairs, days " +
-      "and stay lengths were covered, so partial coverage is never silent. The key-less reader serves about " +
-      `${_readerRate()} lookups a minute per visitor; lookups are queued under that rate (the progress line shows ` +
-      "any wait), so a large sweep takes a few minutes. A free reader API key in ⚙️ settings removes the wait. " +
-      "Round-trip prices are Google's own totals; Google's round-trip page lists only the outbound itinerary, " +
-      "so the return flight shown is the cheapest return on that date (same airline when available), fetched " +
-      `separately for the flights on display (up to ${returnLimit}). ` +
+      (fullGrid <= lookupCeiling && !stopped
+        ? "This search was EXHAUSTIVE: every airport pair, every stay length and every single day of the window was " +
+          `looked up (${fullGrid} lookups), so the cheapest option listed really is the cheapest on offer. `
+        : stopped
+          ? "This run was stopped early, so the grid was only partly swept — the results below are what had been " +
+            "found by then; run it again (or resume) to complete the coverage. "
+          : "This grid (every pair × stay length × day) needs " +
+            `${fullGrid} lookups, which is past the safety cap of ${lookupCeiling}. Airport pairs and stay lengths ` +
+            "were still all covered, and calendar days were spread across the window; the header states exactly how " +
+            "many. Raise “Lookup ceiling” in ⚙️ settings (0 = exhaustive) to cover more days. ") +
+      "Each lookup is one reader request; the key-less reader serves about " +
+      `${_readerRate()} a minute per visitor and the sweep is queued under that rate, so a big run takes a while — ` +
+      "the progress line shows the wait, the elapsed time and an ETA, and it is checkpointed so a reload can resume it. " +
+      "A free reader API key in ⚙️ settings removes the wait. " +
+      "Round-trip prices are Google's own totals for the exact pair of dates (outbound + stay); Google's round-trip " +
+      "page lists only the outbound itinerary, so the return flight shown is the cheapest return on that same date " +
+      `(same airline when available), fetched separately for the flights on display (up to ${returnLimit}). ` +
       (params.direct_only ? "Only nonstop itineraries were requested. " : "") +
       "Open-jaw totals are estimated from two separate one-ways.",
   };
@@ -1417,8 +1576,11 @@ function renderResults(data) {
     <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
     <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days</span>
     ${data.direct_only ? `<span>Direct (nonstop) only</span>` : ""}
-    <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? " · partial (time limit)" : ""}</span>
-    ${data.pairs_available ? `<span>Coverage: <strong>${data.pairs_searched}/${data.pairs_available}</strong> airport pairs · <strong>${data.dates_checked}/${data.dates_in_window}</strong> dates · <strong>${data.stays_checked}/${data.stays_requested}</strong> stay lengths</span>` : ""}
+    <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? (data.stopped_by_user ? " · partial (stopped by you)" : " · partial (time limit)") : ""}</span>
+    ${data.exhaustive && !data.safety_capped && !data.stopped_early
+      ? `<span class="coverage-complete">Exhaustive: every airport pair × every stay length × <strong>every day</strong> of the window (${data.grid_total} lookups) — the cheapest option listed is the cheapest on offer</span>`
+      : ""}
+    ${data.pairs_available ? `<span>Coverage: <strong>${data.pairs_searched}/${data.pairs_available}</strong> airport pairs · <strong>${data.dates_checked}/${data.dates_in_window}</strong> dates · <strong>${data.stays_checked}/${data.stays_requested}</strong> stay lengths${data.safety_capped ? ` · grid is ${data.grid_total} lookups, capped at ${data.lookup_ceiling} (raise ⚙️ Lookup ceiling)` : ""}</span>` : ""}
     <span>Return details loaded for <strong>${data.return_fetches || 0}</strong> flight${(data.return_fetches || 0) === 1 ? "" : "s"}; each one is a separate reader lookup, so rows beyond that show the return date only${data.returns_truncated ? " (raise the ceiling in ⚙️ to load more)" : ""}</span>
     ${data.routes_fully_swept
       ? `<span>Every day of the window swept for <strong>${data.routes_fully_swept}</strong> of <strong>${data.routes_available}</strong> routes</span>`
@@ -1539,25 +1701,50 @@ function bindResolveHint(inputId, hintId) {
 }
 
 const SETTINGS_KEY = "flightsfinder-settings";
+// Bumped when a stored default becomes wrong for the new build (v1 stored the
+// old numeric lookup ceiling, which would otherwise keep the app non-exhaustive).
+const SETTINGS_VERSION = 2;
 
 function loadSettings() {
   let s = {};
   try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch (e) {}
   $("readerUrl").value = s.readerUrl || window.FLIGHT_READER || "https://r.jina.ai/";
   $("readerKey").value = s.readerKey || window.FLIGHT_READER_KEY || "";
-  $("maxSearches").value = s.maxSearches || window.MAX_SEARCHES || 200;
+  // 0 (or blank) means exhaustive — keep the raw value so 0 isn't replaced.
+  const cfgCeiling = window.MAX_SEARCHES != null ? window.MAX_SEARCHES : 0;
+  const storedCeiling = s.v === SETTINGS_VERSION && s.maxSearches != null && s.maxSearches !== ""
+    ? s.maxSearches
+    : cfgCeiling;
+  $("maxSearches").value = String(storedCeiling);
   const hosts = s.googleHosts || (window.FLIGHT_GOOGLE_HOSTS || []);
   $("googleHosts").value = Array.isArray(hosts) ? hosts.join(", ") : String(hosts || "");
 }
 function saveSettings() {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      v: SETTINGS_VERSION,
       readerUrl: $("readerUrl").value.trim(),
       readerKey: $("readerKey").value.trim(),
-      maxSearches: parseInt($("maxSearches").value, 10) || window.MAX_SEARCHES || 200,
+      maxSearches: $("maxSearches").value.trim(),
       googleHosts: $("googleHosts").value.trim(),
     }));
   } catch (e) {}
+}
+
+/** Fill the form from a stored params object (used when resuming a search). */
+function applyParamsToForm(p) {
+  const set = (id, v) => { if ($(id) != null && v != null) $(id).value = v; };
+  set("origin", p.origin);
+  set("destination", p.destination);
+  set("min_days", p.min_days);
+  set("max_days", p.max_days);
+  set("date_from", p.date_from);
+  set("date_to", p.date_to);
+  set("date_mode", p.date_mode);
+  set("currency", p.currency);
+  set("open_jaw", p.open_jaw ? "true" : "false");
+  const dc = $("direct_only");
+  if (dc) dc.checked = !!p.direct_only;
 }
 
 function wire() {
@@ -1575,16 +1762,22 @@ function wire() {
     $(id).addEventListener("change", saveSettings);
   }
 
-  $("searchForm").addEventListener("submit", async (e) => {
-    e.preventDefault();
+  // One place that runs a search from the form, so the resume banner can reuse it.
+  async function doSearch(opts) {
     $("errorBox").style.display = "none";
     $("results").style.display = "none";
+    $("resumeBox").style.display = "none";
     $("progress").style.display = "block";
     $("progress").textContent = "Contacting the reader…";
     const btn = $("submitBtn");
+    const stopBtn = $("stopBtn");
     btn.disabled = true;
     $("btnText").style.display = "none";
     $("btnSpin").style.display = "inline-block";
+    stopBtn.style.display = "inline-flex";
+    stopBtn.disabled = false;
+    stopBtn.textContent = "Stop & show results";
+    window._stopRequested = false;
 
     const params = {
       origin: $("origin").value.trim(),
@@ -1601,23 +1794,31 @@ function wire() {
     window._currency = params.currency;
     saveSettings();
 
+    const onLine = (p) => {
+      const label = p.phase === "returns" ? "Loading return flights"
+        : p.phase === "every day" ? "Sweeping more dates"
+        : "Searching airports";
+      const secs = Math.round((p.elapsedMs || 0) / 1000);
+      const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+      const waiting = p.throttleMs && p.throttleMs > 1000
+        ? ` · waiting for the free reader's quota (${Math.ceil(p.throttleMs / 1000)}s) — a free reader key in ⚙️ removes this wait`
+        : "";
+      const eta = p.phase !== "returns" && p.total
+        ? ` · ~${p.etaMinutes || 1} min total on the free reader`
+        : "";
+      const plan = p.capped
+        ? ` · grid is ${p.gridTotal} lookups (capped at ${p.lookupCeiling}) — raise ⚙️ Lookup ceiling (0 = exhaustive) for complete coverage`
+        : (p.exhaustive && p.gridTotal
+          ? ` · exhaustive: every day × every stay length × every airport pair (${p.gridTotal} lookups)`
+          : "");
+      $("progress").innerHTML =
+        `<strong>${label}…</strong> ${p.done}/${p.total} lookups [${clock}] · ${p.found} options found` +
+        (p.errors ? ` · ${p.errors} failed` : "") +
+        `<br><span class="progress-sub">keep this tab open${plan}${waiting}${eta}</span>`;
+    };
+
     try {
-      const data = await runSearch(params, (p) => {
-        const label = p.phase === "returns" ? "Loading return flights"
-          : p.phase === "every day" ? "Sweeping more dates"
-          : "Searching airports";
-        const secs = Math.round((p.elapsedMs || 0) / 1000);
-        const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
-        const waiting = p.throttleMs && p.throttleMs > 1000
-          ? ` · waiting for the free reader's quota (${Math.ceil(p.throttleMs / 1000)}s) — a free reader key in ⚙️ removes this wait`
-          : "";
-        const eta = p.phase !== "returns" && p.total
-          ? ` · up to ~${p.etaMinutes || 1} min on the free reader`
-          : "";
-        $("progress").textContent =
-          `${label}… ${p.done}/${p.total} lookups [${clock}] · ${p.found} options found` +
-          (p.errors ? ` · ${p.errors} failed` : "") + waiting + eta;
-      });
+      const data = await runSearch(params, onLine, opts);
       renderResults(data);
       $("results").style.display = "block";
     } catch (err) {
@@ -1628,8 +1829,40 @@ function wire() {
       $("btnText").style.display = "inline";
       $("btnSpin").style.display = "none";
       $("progress").style.display = "none";
+      stopBtn.style.display = "none";
     }
+  }
+
+  $("searchForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    doSearch();
   });
+
+  $("stopBtn").addEventListener("click", () => {
+    // Stop politely: workers finish their in-flight lookup, then the results
+    // found so far are rendered (return details are skipped to free quota).
+    window._stopRequested = true;
+    $("stopBtn").disabled = true;
+    $("stopBtn").textContent = "Stopping…";
+  });
+
+  // A long exhaustive sweep can outlive a reload, so offer to continue it.
+  const stored = readStoredRun();
+  if (stored) {
+    const when = new Date(stored.saved || Date.now()).toLocaleString();
+    $("resumeText").textContent =
+      `Unfinished search from ${when}: ${stored.done.length} lookups already done for ` +
+      `“${stored.params.origin}” → “${stored.params.destination}”. Resume it (skips the finished lookups) or discard it.`;
+    $("resumeBox").style.display = "flex";
+    $("resumeBtn").addEventListener("click", () => {
+      applyParamsToForm(stored.params);
+      doSearch({ resume: { done: stored.done, options: stored.options } });
+    });
+    $("resumeDiscard").addEventListener("click", () => {
+      clearStoredRun();
+      $("resumeBox").style.display = "none";
+    });
+  }
 
   (async () => {
     try { await loadAirports(); } catch (e) {}

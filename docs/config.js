@@ -32,23 +32,33 @@ window.FLIGHT_GOOGLE_HOSTS = [
   "www.google.com",
 ];
 
-// Lookup ceiling for a single search. This is how many route/date lookups the
-// sweep may perform. It is treated as a FLOOR when more airports still need
-// covering (every resolved airport pair is always attempted), and as a ceiling
-// for deep calendar sweeps. Each lookup is one reader request, so a big
-// multi-airport "every day" search does take a while — see
-// READER_MAX_PER_MINUTE below. Raise it for more exhaustive date coverage,
-// lower it to be quick.
-window.MAX_SEARCHES = 80;
+// Lookup ceiling for a single search. Each lookup is one reader request and
+// covers one airport pair × one stay length × one calendar day.
+//
+//   0  = EXHAUSTIVE (default): sweep every airport pair, every stay length and
+//        EVERY calendar day in the window, so the reported cheapest option is
+//        genuinely the cheapest on offer. Time is not a constraint — the sweep
+//        is paced by READER_MAX_PER_MINUTE below and shows an ETA. A 5-airport
+//        month-long search is ~620 lookups ≈ 35 minutes key-less.
+//   >0 = spend at most that many lookups. Every airport pair and stay length is
+//        still always attempted (the cap is a floor for coverage), and the rest
+//        of the budget goes to calendar days, spread evenly across the window.
+//
+// MAX_SEARCHES_SAFETY is the hard ceiling applied in exhaustive mode, so a
+// pathological grid (a whole country → a whole country, month-long, wide stay
+// range) can't queue tens of thousands of requests. Raise it if you really want
+// that; the app always reports exactly what it covered.
+window.MAX_SEARCHES = 0;
+window.MAX_SEARCHES_SAFETY = 1500;
 
 // How many reader requests may run at once (be polite to the free service).
 window.SEARCH_CONCURRENCY = 3;
 
 // The key-less reader serves roughly 20 lookups per rolling minute per visitor
 // and answers HTTP 429 beyond that (one lookup = one rendered Google Flights
-// page). Requests are queued to stay under this rate instead of failing, so a
-// 80-lookup sweep takes about 4–5 minutes. A free reader API key lifts the
-// limit; see the ⚙️ settings panel.
+// page). Requests are queued to stay under this rate instead of failing, and
+// the progress line shows the wait plus an ETA. A free reader API key lifts the
+// limit a lot; see the ⚙️ settings panel.
 window.READER_MAX_PER_MINUTE = 18;
 
 // Minimum number of return-direction lookups for the displayed flights. This
@@ -56,5 +66,6 @@ window.READER_MAX_PER_MINUTE = 18;
 // lookup is a reader request that competes with the date sweep for quota.
 window.RETURN_FETCH_LIMIT = 16;
 
-// Hard stop for a search (partial results are returned instead).
-window.SEARCH_TIME_BUDGET_MS = 900000;
+// Hard stop for a search in milliseconds; 0 = no time limit (only the Stop
+// button ends a run). Partial results are shown either way.
+window.SEARCH_TIME_BUDGET_MS = 0;

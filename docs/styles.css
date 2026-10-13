@@ -348,3 +348,49 @@ details summary::-webkit-details-marker { display: none; }
   color: var(--muted);
   text-align: center;
 }
+
+/* search / stop button row */
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: stretch;
+  margin-top: 1.25rem;
+}
+.actions .btn { margin-top: 0; }
+.btn-stop {
+  width: auto;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  background: linear-gradient(135deg, #ef4444, #b91c1c);
+}
+
+/* resume banner for a checkpointed (interrupted) search */
+.resume-box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid #f59e0b55;
+  border-radius: 0.6rem;
+  background: #f59e0b12;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+.btn-mini {
+  padding: 0.35rem 0.7rem;
+  border-radius: 0.45rem;
+  border: none;
+  background: #f59e0b;
+  color: #1f2937;
+  font-weight: 600;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.btn-mini.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.coverage-complete { color: var(--accent2); }
