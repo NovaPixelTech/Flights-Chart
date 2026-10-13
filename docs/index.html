@@ -4,7 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Cheap Flights Finder — Live, 100% static</title>
-  <link rel="stylesheet" href="./styles.css" />
+  <!-- The ?v= query on these assets is stamped with the commit SHA on every
+       deploy (see the Pages workflow), so a returning visitor never runs a
+       stale cached script. -->
+  <link rel="stylesheet" href="./styles.css?v=__BUILD__" />
 </head>
 <body>
   <div class="container">
@@ -140,7 +143,7 @@
     </div>
   </div>
 
-  <script src="./config.js"></script>
-  <script src="./app.js"></script>
+  <script src="./config.js?v=__BUILD__"></script>
+  <script src="./app.js?v=__BUILD__"></script>
 </body>
 </html>
