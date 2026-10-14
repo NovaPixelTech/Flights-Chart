@@ -7,13 +7,35 @@
   <!-- The ?v= query on these assets is stamped with the commit SHA on every
        deploy (see the Pages workflow), so a returning visitor never runs a
        stale cached script. -->
+  <link rel="icon" id="faviconLink" type="image/svg+xml" href="./favicon.svg?v=__BUILD__" />
   <link rel="stylesheet" href="./styles.css?v=__BUILD__" />
 </head>
 <body>
   <div class="container">
     <header>
-      <h1>✈️ Cheap Flights Finder</h1>
-      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Open-jaw supported · Direct-only filter · Outbound <em>and</em> return details</p>
+      <h1 class="brand">
+        <svg class="logo" viewBox="0 0 64 64" role="img" aria-label="FlightsChart" focusable="false">
+          <defs>
+            <linearGradient id="logoBg" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#0ea5e9" />
+              <stop offset="1" stop-color="#6366f1" />
+            </linearGradient>
+            <linearGradient id="logoPlane" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#ffffff" />
+              <stop offset="1" stop-color="#dbeafe" />
+            </linearGradient>
+          </defs>
+          <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#logoBg)" />
+          <path class="logo-arc" d="M11 47 C20 21, 44 21, 53 47" fill="none" stroke="#ffffff"
+                stroke-opacity="0.5" stroke-width="3" stroke-linecap="round" stroke-dasharray="7 9" />
+          <g class="logo-plane">
+            <path d="M12 48 L50 34 L12 20 L12 32 L38 34 L12 38 Z" fill="url(#logoPlane)" />
+          </g>
+          <circle class="logo-dot" cx="53" cy="47" r="3.4" fill="#ffffff" />
+        </svg>
+        <span>Cheap Flights Finder</span>
+      </h1>
+      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Open-jaw supported · Direct-only filter · Outbound <em>and</em> return details · Runs in the background and notifies you when it's done</p>
       <div class="status-row">
         <span class="pill" id="dataPill"><span class="dot"></span><span id="dataPillText">data: live Google Flights</span></span>
         <span class="pill" id="airportPill"><span class="dot"></span><span id="airportPillText">airports: loading…</span></span>
@@ -48,6 +70,14 @@
           <div>
             <label for="date_to">Date window to (≤31 calendar days from start)</label>
             <input id="date_to" name="date_to" type="date" />
+          </div>
+          <div class="full">
+            <label for="window_mode">Date window applies to</label>
+            <select id="window_mode" name="window_mode">
+              <option value="trip">Whole trip — departure and return both inside the window</option>
+              <option value="depart">Departure date only — the return may land after the window</option>
+            </select>
+            <div class="resolve-hint">“Whole trip” (default) means a departure that could not return inside the window is neither searched nor listed — the stay length sets the return date.</div>
           </div>
           <div>
             <label for="date_mode">Date coverage</label>
@@ -87,6 +117,7 @@
             <span id="btnSpin" class="spinner" style="display:none"></span>
           </button>
           <button type="button" class="btn btn-stop" id="stopBtn" style="display:none">Stop &amp; show results</button>
+          <button type="button" class="btn btn-cancel" id="stopCancel" style="display:none">Keep searching</button>
         </div>
         <div id="progress" class="progress" style="display:none"></div>
       </form>
@@ -102,6 +133,25 @@
           <input id="maxSearches" type="number" min="0" max="20000" placeholder="0 = exhaustive" />
           <label for="googleHosts">Google domains to try (comma-separated, in order)</label>
           <input id="googleHosts" placeholder="www.google.co.uk, www.google.ca, www.google.com" autocomplete="off" spellcheck="false" />
+          <div class="settings-sep"></div>
+          <label class="inline-check" for="notifyOnDone">
+            <input type="checkbox" id="notifyOnDone" checked />
+            <span>Notify me when a search finishes (browser notification — you can use other tabs or apps meanwhile)</span>
+          </label>
+          <div class="settings-inline">
+            <button type="button" class="btn-mini ghost" id="notifyBtn">Enable notifications</button>
+            <span class="hint" id="notifyStatus"></span>
+          </div>
+          <label class="inline-check" for="bgKeepAlive">
+            <input type="checkbox" id="bgKeepAlive" checked />
+            <span>Keep sweeping at full speed while this tab is in the background (plays inaudible audio — browsers otherwise throttle hidden tabs to about one lookup a minute)</span>
+          </label>
+          <p class="hint">
+            <strong>Background searches.</strong> A long sweep keeps running while you use other tabs or apps: the
+            tab icon spins, the tab title shows the progress, and when the results are ready you get a browser
+            notification (allowing notifications when asked makes this work even when the tab is hidden). On phones
+            the page must stay open — iOS suspends background tabs entirely, so the run resumes when you return.
+          </p>
           <p class="hint">
             This page is <strong>100% static</strong> — no servers, no accounts, no API keys required.
             It asks a public reader service to render the Google&nbsp;Flights results page, then parses
@@ -110,10 +160,16 @@
           </p>
           <p class="hint">
             <strong>Accuracy first.</strong> The app defaults to an <strong>exhaustive</strong> search: every airport
-            pair, every stay length and <strong>every single day</strong> of the date window is looked up, so the
+            pair, every stay length and <strong>every departure date that fits the window</strong> is looked up, so the
             cheapest option it reports really is the cheapest on offer. Time is not a shortcut here — a
-            5-airport month-long sweep is ~620 lookups ≈ 35 minutes key-less. Keep this tab open while it runs;
-            progress is checkpointed and a reload offers to resume.
+            5-airport month-long sweep is ~490 lookups ≈ 25–30 minutes key-less. It keeps running in the
+            background (see above), progress is checkpointed and a reload offers to resume.
+          </p>
+          <p class="hint">
+            <strong>Date window = whole trip.</strong> By default every listed flight departs <em>and</em> returns
+            inside the window you set. Example: with a 6–7&nbsp;day stay and a window of 06.12.2026–13.12.2026 only
+            06.12 (6- and 7-day stay) and 07.12 (6 days) can still return in time, so the older departures are not
+            searched or listed — choose “Departure date only” if you want to allow a return after the window.
           </p>
           <p class="hint">
             <strong>Why a big search takes a while:</strong> the key-less reader serves roughly
@@ -121,7 +177,7 @@
             and answers <em>HTTP&nbsp;429</em> past that. Rather than failing, the app queues its
             lookups under that rate and shows the wait, the elapsed time and an ETA in the progress line.
             A <strong>free reader API key</strong> lifts the limit, so paste one here if you want to sweep big
-            airport sets quickly. Setting the ceiling above 0 caps the sweep (calendar days are spread across
+            airport sets quickly. Setting the ceiling above 0 caps the sweep (departure dates are spread across
             the window and the result header states exactly what was covered); <strong>0 means exhaustive</strong>.
           </p>
         </div>

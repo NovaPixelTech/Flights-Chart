@@ -638,11 +638,41 @@ function formatDuration(min) {
   const m = min % 60;
   return h + "h " + m + "m";
 }
-/** ISO date (YYYY-MM-DD / YYYY-MM-DD HH:MM) → DD.MM.YYYY. */
+const _DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+let _dowFmt;
+/**
+ * Abbreviated weekday for an ISO date, in the visitor's own language when the
+ * browser offers it (Node/tests and old browsers fall back to English).
+ */
+function weekdayAbbr(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || "").slice(0, 10));
+  if (!m) return "";
+  const dt = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  try {
+    if (_dowFmt === undefined) {
+      _dowFmt = (typeof Intl !== "undefined" && Intl.DateTimeFormat)
+        ? new Intl.DateTimeFormat(undefined, { weekday: "short", timeZone: "UTC" })
+        : null;
+    }
+    if (_dowFmt) return _dowFmt.format(dt);
+  } catch (e) { /* fall through to English */ }
+  return _DOW[dt.getUTCDay()];
+}
+
+/** ISO date (YYYY-MM-DD / YYYY-MM-DD HH:MM) → "Sun 06.12.2026". */
 function fmtDate(iso) {
   const s = String(iso || "").slice(0, 10);
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-  return m ? `${m[3]}.${m[2]}.${m[1]}` : s;
+  if (!m) return s;
+  return `${weekdayAbbr(s)} ${m[3]}.${m[2]}.${m[1]}`;
+}
+
+/** "Sun 06.12.2026 06:30" → { date: "Sun 06.12.2026", time: "06:30" }. */
+function _splitStamp(s) {
+  const v = String(s || "").trim();
+  const m = /^(.*?)\s+(\d{1,2}:\d{2})$/.exec(v);
+  if (!m) return { date: v, time: "" };
+  return { date: m[1], time: m[2] };
 }
 
 function toFlightDict(opt, ctx, airlineNames) {
@@ -981,8 +1011,34 @@ async function runSearch(params, onProgress, opts) {
 
   const minDays = Math.max(1, Math.min(30, params.min_days || 7));
   const maxDays = Math.max(minDays, Math.min(30, params.max_days || minDays));
-  const stayLengths = [];
-  for (let s = minDays; s <= maxDays; s++) stayLengths.push(s);
+  const askedStays = maxDays - minDays + 1;
+
+  // The date window applies to the WHOLE TRIP by default: every flight that is
+  // listed departs AND returns inside it, so a departure that could only return
+  // after the window is never searched (and never listed). Choosing
+  // "Departure date only" lifts that, allowing a return after the window.
+  const tripWindow = params.window_mode !== "depart";
+  const stayPlan = [];   // [{ stay, dates: [outbound ISO…], lastOut: Date }]
+  for (let s = minDays; s <= maxDays; s++) {
+    const lastOut = tripWindow ? addDays(end, -s) : end; // outbound + s days ≤ end
+    if (lastOut < start) continue;                       // this stay could never finish in time
+    const dates = [];
+    for (let d = new Date(start); d <= lastOut; d = addDays(d, 1)) dates.push(isoLocal(d));
+    stayPlan.push({ stay: s, dates, lastOut });
+  }
+  if (!stayPlan.length) {
+    throw new Error(
+      `A ${minDays === maxDays ? minDays + "-day" : `${minDays}–${maxDays} day`} stay cannot start and finish inside ` +
+      `the date window ${fmtDate(isoLocal(start))} – ${fmtDate(isoLocal(end))} (${windowDays} day${windowDays === 1 ? "" : "s"}). ` +
+      `Widen the window (at least ${minDays + 1} days), shorten the stay, or set “Date window applies to” → ` +
+      `“Departure date only” if the return is allowed to land after the window.`
+    );
+  }
+  const stayLengths = stayPlan.map((p) => p.stay);
+  const staysDropped = askedStays - stayLengths.length;
+  // Departure dates that can still produce a trip inside the window.
+  const sweepDates = Array.from(new Set([].concat(...stayPlan.map((p) => p.dates)))).sort();
+  const stayDateSlots = stayPlan.reduce((n, p) => n + p.dates.length, 0);
 
   const currency = params.currency || "USD";
 
@@ -1029,26 +1085,32 @@ async function runSearch(params, onProgress, opts) {
   const routePairs = pairs.slice(0, nPairs);
   const routeCount = Math.max(1, routePairs.length * nStays);
 
-  const fullGrid = routeCount * windowDays;
+  // The real grid: every surviving (stay, departure date) slot × every pair.
+  const fullGrid = routePairs.length * stayDateSlots;
   const lookupCeiling = exhaustive
     ? Math.max(1, Math.min(fullGrid, safetyCap))
     : Math.max(1, Math.min(requestedCeiling, 50000));
 
-  // How many days the broad pass covers. With enough budget this is the whole
-  // window — i.e. the entire grid in a single exhaustive pass. "Sampled days"
-  // is the explicit fast path: a few spread-out days and no deep pass, whatever
-  // the budget.
+  // How many days the broad pass covers, per stay length (each stay has its own
+  // set of departures that can still return inside the window). With enough
+  // budget this is every such day — i.e. the entire grid in a single exhaustive
+  // pass. "Sampled days" is the explicit fast path: a few spread-out days and
+  // no deep pass, whatever the budget.
   const SAMPLED_DAYS = 4;
-  let broadCount;
   const datesWeCanAfford = Math.max(1, Math.floor(lookupCeiling / routeCount));
-  if (!thorough) {
-    broadCount = Math.max(1, Math.min(windowDays, SAMPLED_DAYS));
-  } else if (fullGrid <= lookupCeiling) {
-    broadCount = windowDays; // everything fits — sweep every day, exhaustively
-  } else {
-    broadCount = Math.max(1, Math.min(windowDays, datesWeCanAfford));
-  }
-  const broadDates = spreadDates(start, end, broadCount);
+  const _broadCache = new Map();
+  /** The broad-pass departure dates for one stayPlan entry (cached). */
+  const broadDatesFor = (p) => {
+    if (!_broadCache.has(p.stay)) {
+      const n = !thorough
+        ? Math.min(p.dates.length, SAMPLED_DAYS)
+        : (fullGrid <= lookupCeiling
+          ? p.dates.length // everything fits — sweep every day, exhaustively
+          : Math.max(1, Math.min(p.dates.length, datesWeCanAfford)));
+      _broadCache.set(p.stay, new Set(spreadDates(start, p.lastOut, n)));
+    }
+    return _broadCache.get(p.stay);
+  };
 
   const searchedOrigins = new Set();
   const routeKey = (o, d, s) => `${o}|${d}|${s}`;
@@ -1073,14 +1135,21 @@ async function runSearch(params, onProgress, opts) {
     : sweepKey(t.origin, t.dest, t.stay, t.outbound));
   const pendingOnly = (list) => (alreadyDone.size ? list.filter((t) => !alreadyDone.has(taskId(t))) : list);
 
-  // ---- pass 1: broad grid, every route on the broad dates ----
-  // Ordered date-major from the middle of the window outwards, then by airport
-  // pair and stay length, so an interrupted sweep still has balanced coverage
-  // (every pair checked on the spread days) instead of one airport swallowed whole.
+  // ---- pass 1: broad grid, every route on its broad dates ----
+  // Ordered date-major from the middle of each stay's usable range outwards,
+  // then by airport pair and stay length, so an interrupted sweep still has
+  // balanced coverage (every pair checked on the spread days) instead of one
+  // airport swallowed whole.
+  const broadSetFor = new Map(stayPlan.map((p) => [p.stay, broadDatesFor(p)]));
+  const broadDatesUnion = Array.from(new Set(
+    [].concat(...stayPlan.map((p) => Array.from(broadSetFor.get(p.stay))))
+  )).sort();
   const broadTasks = [];
-  for (const outbound of bisectionOrder(broadDates.slice())) {
+  for (const outbound of bisectionOrder(broadDatesUnion)) {
     for (const pair of routePairs) {
-      for (const stay of stayLengths) broadTasks.push(rtTask(pair[0], pair[1], outbound, stay));
+      for (const p of stayPlan) {
+        if (broadSetFor.get(p.stay).has(outbound)) broadTasks.push(rtTask(pair[0], pair[1], outbound, p.stay));
+      }
     }
   }
 
@@ -1193,6 +1262,11 @@ async function runSearch(params, onProgress, opts) {
       if (!orgSet.has(f.origin_airport) || !dstSet.has(f.dest_airport)) continue;
       if (f.outbound_date < firstDate || f.outbound_date > lastDate) continue;
       if (f.stay_days != null && (f.stay_days < minDays || f.stay_days > maxDays)) continue;
+      // Under the trip window a restored option must still return inside it.
+      if (tripWindow && f.stay_days != null) {
+        const back = isoLocal(addDays(parseISODate(f.outbound_date), f.stay_days));
+        if (back > lastDate) continue;
+      }
       searchedOrigins.add(f.origin_airport);
       record(f);
     }
@@ -1283,41 +1357,65 @@ async function runSearch(params, onProgress, opts) {
       return pa - pb;
     });
 
-    // Fill in the days the broad pass skipped, cheapest route first, until the
-    // lookup ceiling is reached. A route whose whole remaining calendar fits
-    // gets it; otherwise it gets ~80% of what is left and the next route gets
-    // a share too, so one badly-ranked route can't swallow the budget.
-    // Missing days are visited in bisection order (the middle of the window
+    // Fill in the days the broad pass skipped, cheapest pair first, until the
+    // lookup ceiling is reached. A pair whose whole remaining calendar fits
+    // gets it; otherwise it gets ~80% of what is left and the next pair gets a
+    // share too, so one badly-ranked pair can't swallow the budget.
+    // Missing days are visited in bisection order (the middle of the range
     // first, then the middles of the halves, …) so that partial coverage is
     // spread evenly instead of leaving a whole month-end unchecked.
-    const missing = bisectionOrder(allDates.filter((d) => !broadDates.includes(d)));
+    //
+    // Each stay length has its own usable departures, and a "day" means one
+    // departure date × every stay still missing it: whole days only, so a pair
+    // is never left half-swept on a date.
+    const missingPerStay = new Map(stayPlan.map((p) => [
+      p.stay, bisectionOrder(p.dates.filter((d) => !broadSetFor.get(p.stay).has(d))),
+    ]));
+    const missingDates = bisectionOrder(Array.from(new Set(
+      [].concat(...stayPlan.map((p) => missingPerStay.get(p.stay)))
+    )).sort());
+    const missingStaysFor = (date) => stayPlan
+      .filter((p) => missingPerStay.get(p.stay).includes(date))
+      .map((p) => p.stay);
+    const minGroup = missingDates.length
+      ? Math.min.apply(null, missingDates.map((d) => missingStaysFor(d).length))
+      : 1;
     const deepTasks = [];
     const deepPairs = new Map();
     let room = lookupCeiling - broadTasks.length - ojTasks.length;
     for (const pair of rankedPairs) {
       if (room <= 0) break;
-      const deficit = missing.length * stayLengths.length;
+      const deficit = stayPlan.reduce((n, p) => n + missingPerStay.get(p.stay).length, 0);
       const reserve = rankedPairs.length > 1 ? Math.ceil(room * 0.2) : 0;
-      let share = room - reserve >= deficit ? deficit : Math.max(stayLengths.length, Math.ceil((room - reserve) * 0.8));
+      let share = room - reserve >= deficit ? deficit : Math.max(minGroup, Math.ceil((room - reserve) * 0.8));
       share = Math.min(share, room);
       const pk = pair.join("|");
       let spent = 0;
-      const days = new Set();
-      for (const outbound of missing) {
-        if (share < stayLengths.length) break; // only ever take whole days
-        for (const stay of stayLengths) {
-          if (room <= 0) break;
+      const taken = new Map(stayPlan.map((p) => [p.stay, new Set(broadSetFor.get(p.stay))]));
+      for (const outbound of missingDates) {
+        const group = missingStaysFor(outbound);
+        if (!group.length) continue;
+        if (share < group.length || room < group.length) continue; // whole days only
+        for (const stay of group) {
           deepTasks.push(rtTask(pair[0], pair[1], outbound, stay));
           share--;
           room--;
           spent++;
-          days.add(outbound);
+          taken.get(stay).add(outbound);
         }
       }
-      if (spent) deepPairs.set(pk, { lookups: spent, dates: days.size + broadDates.length });
+      if (spent) {
+        // Departure dates this pair has FULLY swept (every stay that could
+        // start on that date was checked), out of every date the pair can be
+        // asked about.
+        const allPairDates = Array.from(new Set([].concat(...stayPlan.map((p) => p.dates)))).sort();
+        const full = allPairDates.filter((d) =>
+          stayPlan.every((p) => !p.dates.includes(d) || taken.get(p.stay).has(d))).length;
+        deepPairs.set(pk, { lookups: spent, dates: full, total: allPairDates.length });
+      }
     }
     deepPairList = Array.from(deepPairs.entries())
-      .map(([k, v]) => `${k.split("|").join("→")} (${v.dates} days)`);
+      .map(([k, v]) => `${k.split("|").join("→")} (${v.dates}/${v.total} days)`);
     const deepPending = pendingOnly(deepTasks);
     if (deepPending.length) {
       planned.deep = deepPending.length;
@@ -1397,12 +1495,34 @@ async function runSearch(params, onProgress, opts) {
   }
   let fullySweptRoutes = 0;
   for (const pair of routePairs) {
-    for (const stay of stayLengths) {
-      const set = sweptRouteDates.get(routeKey(pair[0], pair[1], stay));
-      if (set && allDates.every((dt) => set.has(dt))) fullySweptRoutes++;
+    for (const p of stayPlan) {
+      const set = sweptRouteDates.get(routeKey(pair[0], pair[1], p.stay));
+      if (set && p.dates.every((dt) => set.has(dt))) fullySweptRoutes++;
     }
   }
   const datesChecked = Array.from(sweptDates).sort();
+
+  // Plain-language statement of what the date window meant for this run, so the
+  // trip-window rule can never look like a missing result.
+  const stayLabel = minDays === maxDays ? `${minDays}-day` : `${minDays}–${maxDays} day`;
+  const windowNote = (() => {
+    const from = fmtDate(isoLocal(start));
+    const to = fmtDate(isoLocal(end));
+    if (!tripWindow) {
+      return `Date window covers the departure date only — a return may land after ${to}.`;
+    }
+    let s = `Trip window: every listed flight departs and returns inside ${from} – ${to}`;
+    if (sweepDates.length < windowDays) {
+      s += `, so departures run ${from} – ${fmtDate(sweepDates[sweepDates.length - 1])} ` +
+        `(a ${stayLabel} stay cannot start later and still return in time)`;
+    }
+    s += ".";
+    if (staysDropped) {
+      s += ` ${staysDropped} of ${askedStays} stay length${askedStays === 1 ? "" : "s"} could not fit ` +
+        `and ${staysDropped === 1 ? "was" : "were"} skipped.`;
+    }
+    return s;
+  })();
 
   return {
     origin_input: params.origin,
@@ -1425,8 +1545,13 @@ async function runSearch(params, onProgress, opts) {
     pairs_searched: sweptPairs.size,
     dates_checked: datesChecked.length,
     dates_in_window: windowDays,
+    dates_sweepable: sweepDates.length,
+    window_mode: tripWindow ? "trip" : "depart",
+    window_note: windowNote,
     stays_checked: sweptStays.size,
     stays_requested: stayLengths.length,
+    stays_asked: askedStays,
+    stays_dropped: staysDropped,
     exhaustive,
     grid_total: fullGrid,
     lookup_ceiling: lookupCeiling,
@@ -1449,16 +1574,21 @@ async function runSearch(params, onProgress, opts) {
       "All of Google's itinerary lists (nonstop and connecting) are parsed, so the cheapest option is included. " +
       "Country inputs expand to that country's commercial airports, and every resolved airport pair is searched; " +
       "you can also list airports directly (e.g. \"DUS, FRA, HAM\"). The date window is capped at 31 days. " +
+      (tripWindow
+        ? "The date window applies to the whole trip: a listed flight departs and returns inside it, so departures " +
+          "that could only return after the window are not searched (switch “Date window applies to” to " +
+          "“Departure date only” to allow a later return). "
+        : "The date window applies to the departure date only, so a listed return may land after the window. ") +
       (fullGrid <= lookupCeiling && !stopped
-        ? "This search was EXHAUSTIVE: every airport pair, every stay length and every single day of the window was " +
-          `looked up (${fullGrid} lookups), so the cheapest option listed really is the cheapest on offer. `
+        ? "This search was EXHAUSTIVE: every airport pair, every stay length and every departure date that fits the " +
+          `window was looked up (${fullGrid} lookups), so the cheapest option listed really is the cheapest on offer. `
         : stopped
           ? "This run was stopped early, so the grid was only partly swept — the results below are what had been " +
             "found by then; run it again (or resume) to complete the coverage. "
-          : "This grid (every pair × stay length × day) needs " +
+          : "This grid (every pair × stay length × fitting departure date) needs " +
             `${fullGrid} lookups, which is past the safety cap of ${lookupCeiling}. Airport pairs and stay lengths ` +
-            "were still all covered, and calendar days were spread across the window; the header states exactly how " +
-            "many. Raise “Lookup ceiling” in ⚙️ settings (0 = exhaustive) to cover more days. ") +
+            "were still all covered, and departure dates were spread across the window; the header states exactly how " +
+            "many. Raise “Lookup ceiling” in ⚙️ settings (0 = exhaustive) to cover more dates. ") +
       "Each lookup is one reader request; the key-less reader serves about " +
       `${_readerRate()} a minute per visitor and the sweep is queued under that rate, so a big run takes a while — ` +
       "the progress line shows the wait, the elapsed time and an ETA, and it is checkpointed so a reload can resume it. " +
@@ -1520,14 +1650,14 @@ function renderFlight(f, badgeClass, badgeText) {
 function _dirSummary(legs, airlines, stops) {
   if (!legs || !legs.length) return null;
   const first = legs[0], last = legs[legs.length - 1];
-  const [depDate, depTime] = String(first.departure || "").split(" ");
-  const [arrDate, arrTime] = String(last.arrival || "").split(" ");
-  const arr = (arrDate && arrDate !== depDate) ? `${arrDate} ${arrTime}` : (arrTime || "—");
+  const dep = _splitStamp(first.departure);
+  const arr = _splitStamp(last.arrival);
+  const arrText = (arr.date && arr.date !== dep.date) ? `${arr.date} ${arr.time}` : (arr.time || "—");
   const n = stops != null ? stops : Math.max(0, legs.length - 1);
   return {
     route: `${first.from} → ${last.to}`,
-    date: depDate || "—",
-    times: `${depTime || "—"} – ${arr || "—"}`,
+    date: dep.date || "—",
+    times: `${dep.time || "—"} – ${arrText}`,
     airlines: (airlines || []).join(", ") || "—",
     stops: n === 0 ? "Direct" : (n === 1 ? "1 stop" : n + " stops"),
   };
@@ -1576,16 +1706,17 @@ function renderResults(data) {
   $("resultMeta").innerHTML = `
     <span><strong>${data.origin_input}</strong> → <strong>${data.destination_input}</strong></span>
     <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
-    <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days</span>
+    <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days${data.window_mode === "depart" ? " · window = departure date" : " · whole trip inside the window"}</span>
     ${data.direct_only ? `<span>Direct (nonstop) only</span>` : ""}
     <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? (data.stopped_by_user ? " · partial (stopped by you)" : " · partial (time limit)") : ""}</span>
     ${data.exhaustive && !data.safety_capped && !data.stopped_early
-      ? `<span class="coverage-complete">Exhaustive: every airport pair × every stay length × <strong>every day</strong> of the window (${data.grid_total} lookups) — the cheapest option listed is the cheapest on offer</span>`
+      ? `<span class="coverage-complete">Exhaustive: every airport pair × every stay length × <strong>every departure date that fits the window</strong> (${data.grid_total} lookups) — the cheapest option listed is the cheapest on offer</span>`
       : ""}
-    ${data.pairs_available ? `<span>Coverage: <strong>${data.pairs_searched}/${data.pairs_available}</strong> airport pairs · <strong>${data.dates_checked}/${data.dates_in_window}</strong> dates · <strong>${data.stays_checked}/${data.stays_requested}</strong> stay lengths${data.safety_capped ? ` · grid is ${data.grid_total} lookups, capped at ${data.lookup_ceiling} (raise ⚙️ Lookup ceiling)` : ""}</span>` : ""}
+    ${data.pairs_available ? `<span>Coverage: <strong>${data.pairs_searched}/${data.pairs_available}</strong> airport pairs · <strong>${data.dates_checked}/${data.dates_sweepable != null ? data.dates_sweepable : data.dates_in_window}</strong> departure dates · <strong>${data.stays_checked}/${data.stays_requested}</strong> stay lengths${data.safety_capped ? ` · grid is ${data.grid_total} lookups, capped at ${data.lookup_ceiling} (raise ⚙️ Lookup ceiling)` : ""}</span>` : ""}
+    ${data.window_note ? `<span class="window-note">${data.window_note}</span>` : ""}
     <span>Return details loaded for <strong>${data.return_fetches || 0}</strong> flight${(data.return_fetches || 0) === 1 ? "" : "s"}; each one is a separate reader lookup, so rows beyond that show the return date only${data.returns_truncated ? " (raise the ceiling in ⚙️ to load more)" : ""}</span>
     ${data.routes_fully_swept
-      ? `<span>Every day of the window swept for <strong>${data.routes_fully_swept}</strong> of <strong>${data.routes_available}</strong> routes</span>`
+      ? `<span>Every departure date inside the window swept for <strong>${data.routes_fully_swept}</strong> of <strong>${data.routes_available}</strong> routes</span>`
       : (data.deep_pairs && data.deep_pairs.length
         ? `<span>Deeper calendar sweep for the cheapest routes: <strong>${data.deep_pairs.slice(0, 6).join(" · ")}</strong></span>`
         : "")}
@@ -1720,6 +1851,8 @@ function loadSettings() {
   $("maxSearches").value = String(storedCeiling);
   const hosts = s.googleHosts || (window.FLIGHT_GOOGLE_HOSTS || []);
   $("googleHosts").value = Array.isArray(hosts) ? hosts.join(", ") : String(hosts || "");
+  if ($("notifyOnDone")) $("notifyOnDone").checked = s.notifyOnDone !== false;
+  if ($("bgKeepAlive")) $("bgKeepAlive").checked = s.bgKeepAlive !== false;
 }
 function saveSettings() {
   try {
@@ -1729,8 +1862,211 @@ function saveSettings() {
       readerKey: $("readerKey").value.trim(),
       maxSearches: $("maxSearches").value.trim(),
       googleHosts: $("googleHosts").value.trim(),
+      notifyOnDone: $("notifyOnDone") ? $("notifyOnDone").checked : true,
+      bgKeepAlive: $("bgKeepAlive") ? $("bgKeepAlive").checked : true,
     }));
   } catch (e) {}
+}
+
+/* ------------------------------------------------------------------ *
+ *  Background completion: OS notification, tab title, animated favicon
+ *  and the inaudible keep-alive that keeps the sweep at full speed once
+ *  the tab is hidden (browsers throttle hidden-tab timers otherwise).
+ * ------------------------------------------------------------------ */
+const BASE_TITLE = (typeof document !== "undefined" && document.title) || "Cheap Flights Finder";
+let _staticIconHref = "";
+if (typeof document !== "undefined" && typeof document.querySelector === "function") {
+  const l = document.querySelector('link[rel="icon"]');
+  if (l) _staticIconHref = l.getAttribute("href") || "";
+}
+
+let _favLinkEl = null;
+let _favCanvas = null;
+let _favTimer = null;
+let _favFrame = 0;
+let _favMode = "idle";
+let _favDoneTimer = null;
+let _titleDone = false;
+
+function _favEl() {
+  if (_favLinkEl) return _favLinkEl;
+  if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
+  _favLinkEl = document.getElementById("faviconLink") || document.querySelector('link[rel="icon"]');
+  return _favLinkEl;
+}
+function _roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+/** Paper-plane silhouette drawn in a 64×64 box. */
+function _planePath(ctx) {
+  ctx.beginPath();
+  ctx.moveTo(12, 54);
+  ctx.lineTo(54, 36);
+  ctx.lineTo(12, 18);
+  ctx.lineTo(12, 32);
+  ctx.lineTo(42, 36);
+  ctx.lineTo(12, 40);
+  ctx.closePath();
+}
+function _favFrameDraw(mode, frame) {
+  if (typeof document === "undefined" || typeof document.createElement !== "function") return null;
+  if (!_favCanvas) {
+    _favCanvas = document.createElement("canvas");
+    _favCanvas.width = 64;
+    _favCanvas.height = 64;
+  }
+  const ctx = _favCanvas.getContext && _favCanvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, 64, 64);
+  const g = ctx.createLinearGradient(0, 0, 64, 64);
+  if (mode === "done") { g.addColorStop(0, "#34d399"); g.addColorStop(1, "#0f766e"); }
+  else if (mode === "searching") { g.addColorStop(0, "#38bdf8"); g.addColorStop(1, "#4338ca"); }
+  else { g.addColorStop(0, "#0ea5e9"); g.addColorStop(1, "#6366f1"); }
+  ctx.fillStyle = g;
+  _roundRectPath(ctx, 2, 2, 60, 60, 15);
+  ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.strokeStyle = "#fff";
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  if (mode === "done") {
+    ctx.lineWidth = 9;
+    ctx.beginPath();
+    ctx.moveTo(16, 34);
+    ctx.lineTo(27, 45);
+    ctx.lineTo(49, 20);
+    ctx.stroke();
+  } else {
+    if (mode === "searching") {
+      ctx.save();
+      ctx.translate(32, 32);
+      ctx.rotate((frame % 40) * (Math.PI * 2 / 40));
+      ctx.translate(-32, -32);
+    }
+    _planePath(ctx);
+    ctx.fill();
+    if (mode === "searching") ctx.restore();
+  }
+  try { return _favCanvas.toDataURL("image/png"); } catch (e) { return null; }
+}
+/** mode: "idle" (static SVG) | "searching" (spinning plane) | "done" (check). */
+function setFaviconMode(mode) {
+  const el = _favEl();
+  if (!el) return;
+  if (_favDoneTimer) { clearTimeout(_favDoneTimer); _favDoneTimer = null; }
+  if (mode === "idle") {
+    if (_favTimer) { clearInterval(_favTimer); _favTimer = null; }
+    _favMode = "idle";
+    try { el.type = "image/svg+xml"; el.href = _staticIconHref || "./favicon.svg"; } catch (e) {}
+    return;
+  }
+  _favMode = mode;
+  if (mode === "done" && typeof setTimeout === "function") {
+    _favDoneTimer = setTimeout(() => setFaviconMode("idle"), 15000);
+  }
+  if (_favTimer) return; // the running ticker picks the new mode up
+  _favFrame = 0;
+  const tick = () => {
+    const url = _favFrameDraw(_favMode, _favFrame++);
+    if (!url) return;
+    try { el.type = "image/png"; el.href = url; } catch (e) {}
+  };
+  tick();
+  _favTimer = setInterval(tick, 110);
+}
+function setTabTitle(text) { try { document.title = text; } catch (e) {} }
+function setProgressTitle(p) {
+  if (!p || !p.total) return;
+  setTabTitle(`⏳ ${p.done}/${p.total} lookups · ${p.found || 0} found — Cheap Flights Finder`);
+}
+
+/** Does this browser expose the Notification API at all? */
+function notifySupported() { return typeof Notification === "function"; }
+function notifyPermission() { return notifySupported() ? Notification.permission : "unsupported"; }
+function notifyOnDoneEnabled() { const el = $("notifyOnDone"); return el ? !!el.checked : true; }
+function bgKeepAliveEnabled() { const el = $("bgKeepAlive"); return el ? !!el.checked : true; }
+
+/** Ask once, on the user's own click (browsers ignore gesture-less prompts). */
+function requestNotifyPermission() {
+  if (!notifySupported()) return Promise.resolve("unsupported");
+  try {
+    const r = Notification.requestPermission();
+    return (r && typeof r.then === "function") ? r : Promise.resolve(Notification.permission);
+  } catch (e) { return Promise.resolve("denied"); }
+}
+
+/**
+ * Announce a finished search. The OS notification only works while the browser
+ * (tab or installed app) is alive, so the tab title and the favicon check are
+ * set too — they are visible even when notifications are blocked.
+ */
+function notifyDone(data) {
+  let cheapest = null;
+  try {
+    cheapest = (data.ranked_options && data.ranked_options[0]) ||
+      data.cheapest_direct || data.cheapest_with_stops || null;
+  } catch (e) {}
+  setFaviconMode("done");
+  _titleDone = true;
+  setTabTitle(`✅ Search complete — Cheap Flights Finder`);
+  if (!notifySupported() || !notifyOnDoneEnabled()) return;
+  try {
+    if (Notification.permission !== "granted") return;
+    const head = cheapest && cheapest.price != null
+      ? `Cheapest ${cheapest.price} ${data.currency || ""} · ${cheapest.origin_airport}→${cheapest.dest_airport} ${fmtDate(cheapest.outbound_date)}`.trim()
+      : `${data.all_results_count || 0} options found`;
+    const n = new Notification("FlightsChart — search complete", {
+      body: `${head}\n${data.searches_performed || 0} lookups · ${data.pairs_searched || 0}/${data.pairs_available || 0} airport pairs`,
+      icon: _staticIconHref || undefined,
+      tag: "flightschart-done",
+      renotify: true,
+    });
+    n.onclick = () => { try { window.focus(); n.close(); } catch (e) {} };
+  } catch (e) { /* blocked — the title/favicon still announce it */ }
+}
+
+/* --- inaudible keep-alive: real audio (so the tab is never throttled hard)
+ *     at ~-55 dBFS, i.e. silent on any speaker or headphone. --------------- */
+let _keepWavSrc = null;
+let _keepAudio = null;
+function keepAliveSrc() {
+  if (_keepWavSrc) return _keepWavSrc;
+  const rate = 8000, n = rate; // one second
+  const buf = new Uint8Array(44 + n * 2);
+  const dv = new DataView(buf.buffer);
+  const tag = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  tag(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); tag(8, "WAVE");
+  tag(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  tag(36, "data"); dv.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    dv.setInt16(44 + i * 2, Math.round(60 * Math.sin((2 * Math.PI * 20 * i) / rate)), true);
+  }
+  let bin = "";
+  for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+  _keepWavSrc = "data:audio/wav;base64," + btoa(bin);
+  return _keepWavSrc;
+}
+function startKeepAlive() {
+  if (!bgKeepAliveEnabled()) return;
+  try {
+    if (!_keepAudio && typeof Audio === "function") _keepAudio = new Audio(keepAliveSrc());
+    if (!_keepAudio) return;
+    _keepAudio.loop = true;
+    _keepAudio.volume = 1;
+    const p = _keepAudio.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } catch (e) { /* autoplay policy: the sweep still runs, just slower when hidden */ }
+}
+function stopKeepAlive() {
+  try { if (_keepAudio) { _keepAudio.pause(); _keepAudio.currentTime = 0; } } catch (e) {}
 }
 
 /** Fill the form from a stored params object (used when resuming a search). */
@@ -1743,6 +2079,7 @@ function applyParamsToForm(p) {
   set("date_from", p.date_from);
   set("date_to", p.date_to);
   set("date_mode", p.date_mode);
+  set("window_mode", p.window_mode || "trip");
   set("currency", p.currency);
   set("open_jaw", p.open_jaw ? "true" : "false");
   const dc = $("direct_only");
@@ -1763,6 +2100,43 @@ function wire() {
   for (const id of ["readerUrl", "readerKey", "maxSearches", "googleHosts"]) {
     $(id).addEventListener("change", saveSettings);
   }
+  for (const id of ["notifyOnDone", "bgKeepAlive"]) {
+    if ($(id)) $(id).addEventListener("change", saveSettings);
+  }
+
+  // Browser notification support/permission state, shown right in settings.
+  const syncNotifyStatus = () => {
+    const el = $("notifyStatus");
+    const btn = $("notifyBtn");
+    const p = notifyPermission();
+    if (el) {
+      el.textContent = p === "granted"
+        ? "notifications: on — you'll be told when a search finishes"
+        : p === "denied"
+          ? "notifications: blocked in the browser — the tab title and icon still show progress"
+          : p === "unsupported"
+            ? "this browser has no notifications — the tab title and icon still show progress"
+            : "notifications: not enabled yet";
+    }
+    if (btn) btn.style.display = p === "default" ? "inline-flex" : "none";
+  };
+  if ($("notifyBtn")) {
+    $("notifyBtn").addEventListener("click", () => {
+      Promise.resolve(requestNotifyPermission()).then(syncNotifyStatus, syncNotifyStatus);
+    });
+  }
+  syncNotifyStatus();
+
+  // ---- two-step stop: the first click only arms it, the second confirms ----
+  let stopArmed = false;
+  let stopArmTimer = null;
+  function resetStopConfirm() {
+    stopArmed = false;
+    if (stopArmTimer) { clearTimeout(stopArmTimer); stopArmTimer = null; }
+    const b = $("stopBtn"), c = $("stopCancel");
+    if (b) { b.classList.remove("armed"); b.disabled = false; b.textContent = "Stop & show results"; }
+    if (c) c.style.display = "none";
+  }
 
   // One place that runs a search from the form, so the resume banner can reuse it.
   async function doSearch(opts) {
@@ -1777,9 +2151,17 @@ function wire() {
     $("btnText").style.display = "none";
     $("btnSpin").style.display = "inline-block";
     stopBtn.style.display = "inline-flex";
-    stopBtn.disabled = false;
-    stopBtn.textContent = "Stop & show results";
+    resetStopConfirm();
     window._stopRequested = false;
+    // A long sweep is meant to run in the background: ask for notification
+    // permission while the click gesture is still live, keep the tab from being
+    // throttled (inaudible audio), and show the search in the favicon + title.
+    requestNotifyPermission();
+    startKeepAlive();
+    setFaviconMode("searching");
+    setTabTitle("⏳ Searching — Cheap Flights Finder");
+    try { if (document.body && document.body.classList) document.body.classList.add("searching"); } catch (e) {}
+    Promise.resolve(requestNotifyPermission()).then(syncNotifyStatus, () => {});
 
     const params = {
       origin: $("origin").value.trim(),
@@ -1789,6 +2171,7 @@ function wire() {
       date_from: $("date_from").value || null,
       date_to: $("date_to").value || null,
       date_mode: $("date_mode") ? $("date_mode").value : "sampled",
+      window_mode: $("window_mode") ? $("window_mode").value : "trip",
       currency: $("currency").value,
       open_jaw: $("open_jaw").value === "true",
       direct_only: $("direct_only") ? $("direct_only").checked : false,
@@ -1797,6 +2180,7 @@ function wire() {
     saveSettings();
 
     const onLine = (p) => {
+      setProgressTitle(p);
       const label = p.phase === "returns" ? "Loading return flights"
         : p.phase === "every day" ? "Sweeping more dates"
         : "Searching airports";
@@ -1811,22 +2195,28 @@ function wire() {
       const plan = p.capped
         ? ` · grid is ${p.gridTotal} lookups (capped at ${p.lookupCeiling}) — raise ⚙️ Lookup ceiling (0 = exhaustive) for complete coverage`
         : (p.exhaustive && p.gridTotal
-          ? ` · exhaustive: every day × every stay length × every airport pair (${p.gridTotal} lookups)`
+          ? ` · exhaustive: every departure date that fits the window × every stay length × every airport pair (${p.gridTotal} lookups)`
           : "");
       $("progress").innerHTML =
         `<strong>${label}…</strong> ${p.done}/${p.total} lookups [${clock}] · ${p.found} options found` +
         (p.errors ? ` · ${p.errors} failed` : "") +
-        `<br><span class="progress-sub">keep this tab open${plan}${waiting}${eta}</span>`;
+        `<br><span class="progress-sub">you can switch tabs or apps — the sweep keeps running in the background and a notification tells you when it's done${plan}${waiting}${eta}</span>`;
     };
 
     try {
       const data = await runSearch(params, onLine, opts);
       renderResults(data);
       $("results").style.display = "block";
+      notifyDone(data);
     } catch (err) {
       $("errorBox").textContent = err.message || "Something went wrong";
       $("errorBox").style.display = "block";
+      setFaviconMode("idle");
+      setTabTitle(BASE_TITLE);
     } finally {
+      stopKeepAlive();
+      resetStopConfirm();
+      try { if (document.body && document.body.classList) document.body.classList.remove("searching"); } catch (e) {}
       btn.disabled = false;
       $("btnText").style.display = "inline";
       $("btnSpin").style.display = "none";
@@ -1841,12 +2231,25 @@ function wire() {
   });
 
   $("stopBtn").addEventListener("click", () => {
-    // Stop politely: workers finish their in-flight lookup, then the results
-    // found so far are rendered (return details are skipped to free quota).
+    // Verified stop: the first click only arms the button (and offers "Keep
+    // searching"); stopping needs a second, deliberate click.
+    const b = $("stopBtn"), c = $("stopCancel");
+    if (!stopArmed) {
+      stopArmed = true;
+      if (b) { b.classList.add("armed"); b.textContent = "Confirm stop ⚠️"; }
+      if (c) c.style.display = "inline-flex";
+      stopArmTimer = setTimeout(() => { resetStopConfirm(); }, 8000);
+      return;
+    }
+    // Confirmed: stop politely. Workers finish their in-flight lookup, then the
+    // results found so far are rendered (return details are skipped to free quota).
+    if (stopArmTimer) { clearTimeout(stopArmTimer); stopArmTimer = null; }
+    stopArmed = false;
     window._stopRequested = true;
-    $("stopBtn").disabled = true;
-    $("stopBtn").textContent = "Stopping…";
+    if (b) { b.disabled = true; b.classList.remove("armed"); b.textContent = "Stopping…"; }
+    if (c) c.style.display = "none";
   });
+  if ($("stopCancel")) $("stopCancel").addEventListener("click", () => resetStopConfirm());
 
   // A long exhaustive sweep can outlive a reload, so offer to continue it.
   const stored = readStoredRun();
@@ -1865,6 +2268,15 @@ function wire() {
       $("resumeBox").style.display = "none";
     });
   }
+
+  // Coming back to the tab: the results are on screen, so the title can go
+  // back to normal (the ✅ is only meant to catch the eye from another tab).
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && _titleDone) {
+      _titleDone = false;
+      setTabTitle(BASE_TITLE);
+    }
+  });
 
   (async () => {
     try { await loadAirports(); } catch (e) {}
