@@ -3,11 +3,22 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0ea5e9" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="FlightsChart" />
   <title>Cheap Flights Finder — Live, 100% static</title>
   <!-- The ?v= query on these assets is stamped with the commit SHA on every
        deploy (see the Pages workflow), so a returning visitor never runs a
        stale cached script. -->
   <link rel="icon" id="faviconLink" type="image/svg+xml" href="./favicon.svg?v=__BUILD__" />
+  <!-- Home-screen icons. iOS ignores SVG for an "Add to Home Screen" icon and
+       applies its own rounded mask, so these are opaque, full-bleed PNGs. -->
+  <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png?v=__BUILD__" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon-180.png?v=__BUILD__" />
+  <link rel="apple-touch-icon" sizes="152x152" href="./apple-touch-icon-152.png?v=__BUILD__" />
+  <link rel="apple-touch-icon" sizes="120x120" href="./apple-touch-icon-120.png?v=__BUILD__" />
+  <link rel="manifest" href="./manifest.json?v=__BUILD__" />
   <link rel="stylesheet" href="./styles.css?v=__BUILD__" />
 </head>
 <body>
@@ -151,6 +162,12 @@
             tab icon spins, the tab title shows the progress, and when the results are ready you get a browser
             notification (allowing notifications when asked makes this work even when the tab is hidden). On phones
             the page must stay open — iOS suspends background tabs entirely, so the run resumes when you return.
+          </p>
+          <p class="hint">
+            <strong>Tip: install it as an app.</strong> On iPhone/iPad open <em>Share → Add to Home Screen</em>, on
+            Android <em>⋮ → Add to Home screen</em>. You get a full-screen app with the branded plane icon, and on
+            iOS an installed app is also the only way a web page can send you notifications. (Home-screen tiles are
+            always static images on iOS/Android — the animated logo and favicon live inside the app.)
           </p>
           <p class="hint">
             This page is <strong>100% static</strong> — no servers, no accounts, no API keys required.

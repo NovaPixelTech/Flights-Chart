@@ -24,7 +24,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Stamp asset version (cache-busting)
-        run: sed -i "s/__BUILD__/${GITHUB_SHA::8}/g" docs/index.html
+        run: |
+          sed -i "s/__BUILD__/${GITHUB_SHA::8}/g" docs/index.html
+          sed -i "s/__BUILD__/${GITHUB_SHA::8}/g" docs/manifest.json
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:

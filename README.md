@@ -109,6 +109,25 @@ If a stay cannot fit the window at all (e.g. a 20-day stay in a 8-day window), t
 instead of quietly returning nothing, and suggests widening the window, shortening the stay, or
 switching to *Departure date only*.
 
+## Install it on your phone's home screen
+
+The app ships home-screen icons, so "Add to Home Screen" gives you a real app tile with the brand
+mark instead of a screenshot:
+
+- **iPhone / iPad (Safari).** Open the site, tap **Share** → **Add to Home Screen** → **Add**.
+  It launches full-screen (no Safari bars) and uses `apple-touch-icon.png` (180×180 @3x, plus
+  152×152 and 120×120 variants) — the opaque, full-bleed plane mark in `docs/`.
+- **Android (Chrome).** Open the site, tap **⋮** → **Add to Home screen** / **Install app**. It
+  uses `docs/manifest.json` (`icon-192.png`, `icon-512.png`, standalone display).
+- **Desktop.** Chrome/Edge "Install" and pinned tabs use the same icons.
+
+> **One platform limit, stated plainly:** iOS and Android do **not** animate home-screen icons —
+> the tile is always a static image, so no web app can animate there. The animated plane (header
+> logo + spinning/check tab favicon) therefore lives *inside* the app, and the home-screen tile
+> uses a matching static frame of the same artwork. On iOS, notifications additionally only work
+> for the installed home-screen app (iOS 16.4+), not for a plain Safari tab — another reason to
+> install it.
+
 ## Publish on GitHub Pages
 
 The included workflow `.github/workflows/deploy-pages.yml` deploys `docs/` on every push to
