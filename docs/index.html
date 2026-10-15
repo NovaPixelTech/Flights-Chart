@@ -58,12 +58,14 @@
         <div class="form-grid">
           <div>
             <label for="origin">From (country, city or airport — lists allowed)</label>
-            <input id="origin" name="origin" placeholder="e.g. Germany, BER, or DUS, FRA, HAM" required autocomplete="off" />
+            <input id="origin" name="origin" class="upper" placeholder="e.g. GERMANY, BER, or DUS, FRA, HAM"
+                   autocapitalize="characters" autocorrect="off" spellcheck="false" required autocomplete="off" />
             <div class="resolve-hint" id="originHint"></div>
           </div>
           <div>
             <label for="destination">To (country, city or airport — lists allowed)</label>
-            <input id="destination" name="destination" placeholder="e.g. Athens, Greece, or ATH, SKG" required autocomplete="off" />
+            <input id="destination" name="destination" class="upper" placeholder="e.g. ATHENS, GREECE, or ATH, SKG"
+                   autocapitalize="characters" autocorrect="off" spellcheck="false" required autocomplete="off" />
             <div class="resolve-hint" id="destinationHint"></div>
           </div>
           <div>
@@ -81,6 +83,12 @@
           <div>
             <label for="date_to">Date window to (≤31 calendar days from start)</label>
             <input id="date_to" name="date_to" type="date" />
+          </div>
+          <div class="full">
+            <div class="resolve-hint">The two date fields are the <strong>window</strong>: the “to” calendar only
+              offers days <em>after</em> the “from” date (earlier days and months are greyed out), and picking a
+              departure date automatically sets the return end to departure + the longest stay, so the pair is
+              always valid.</div>
           </div>
           <div class="full">
             <label for="window_mode">Date window applies to</label>

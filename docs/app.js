@@ -2072,8 +2072,8 @@ function stopKeepAlive() {
 /** Fill the form from a stored params object (used when resuming a search). */
 function applyParamsToForm(p) {
   const set = (id, v) => { if ($(id) != null && v != null) $(id).value = v; };
-  set("origin", p.origin);
-  set("destination", p.destination);
+  set("origin", p.origin != null ? String(p.origin).toUpperCase() : null);
+  set("destination", p.destination != null ? String(p.destination).toUpperCase() : null);
   set("min_days", p.min_days);
   set("max_days", p.max_days);
   set("date_from", p.date_from);
@@ -2084,6 +2084,65 @@ function applyParamsToForm(p) {
   set("open_jaw", p.open_jaw ? "true" : "false");
   const dc = $("direct_only");
   if (dc) dc.checked = !!p.direct_only;
+  syncDateBounds(false);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Form input rules
+ *  - The city/country fields are CAPITALS-ONLY: whatever is typed (or
+ *    pasted) is upper-cased as it goes in.
+ *  - The two date fields are the bounds of the search window, so they can
+ *    never contradict each other: the "to" calendar only offers days after
+ *    the "from" date, and picking a departure re-fills the return end.
+ * ------------------------------------------------------------------ */
+
+/** Force an input to uppercase as the user types (caret position preserved). */
+function forceUppercase(el) {
+  if (!el || typeof el.addEventListener !== "function") return;
+  const up = () => {
+    const v = String(el.value == null ? "" : el.value);
+    const u = v.toUpperCase();
+    if (u === v) return;
+    const pos = el.selectionStart;
+    el.value = u;
+    if (typeof el.setSelectionRange === "function" && typeof pos === "number") {
+      try { el.setSelectionRange(pos, pos); } catch (e) { /* e.g. number inputs */ }
+    }
+  };
+  el.addEventListener("input", up);
+  el.addEventListener("change", up);
+  el.addEventListener("blur", up);
+  up();
+}
+
+/**
+ * Keep the date window coherent.
+ * `refill` = the user just picked a departure date, so the return date is set
+ * to departure + the longest stay asked for (that guarantees the stay fits and
+ * that the return is after the departure). Without `refill` only the browser
+ * bounds (`min`/`max`) are corrected, never a date the user chose.
+ */
+function syncDateBounds(refill) {
+  const f = $("date_from"), t = $("date_to");
+  if (!f || !t) return;
+  const from = f.value || "";
+  if (from) {
+    const start = parseISODate(from);
+    // "<input type=date>.min" greys out every earlier day in the picker, so
+    // the return calendar cannot even show a day before/on the departure.
+    const minISO = start ? isoLocal(addDays(start, 1)) : from;
+    t.min = minISO;
+    if (start) {
+      const stay = Math.max(1, Math.min(30, parseInt($("max_days") ? $("max_days").value : "", 10) || 7));
+      const suggested = isoLocal(addDays(start, stay));
+      if (refill || !t.value || t.value < minISO) t.value = suggested;
+    } else if (!t.value) {
+      t.value = from;
+    }
+  } else {
+    t.min = "";
+  }
+  f.max = t.value || "";
 }
 
 function wire() {
@@ -2093,6 +2152,22 @@ function wire() {
   const d2 = addDays(d1, 30);
   $("date_from").value = isoLocal(d1);
   $("date_to").value = isoLocal(d2);
+
+  forceUppercase($("origin"));
+  forceUppercase($("destination"));
+
+  if ($("date_from")) {
+    $("date_from").addEventListener("change", () => syncDateBounds(true));
+    $("date_from").addEventListener("input", () => syncDateBounds(true));
+  }
+  if ($("date_to")) {
+    $("date_to").addEventListener("change", () => syncDateBounds(false));
+    $("date_to").addEventListener("input", () => syncDateBounds(false));
+  }
+  for (const id of ["min_days", "max_days"]) {
+    if ($(id)) $(id).addEventListener("change", () => syncDateBounds(false));
+  }
+  syncDateBounds(false);
 
   bindResolveHint("origin", "originHint");
   bindResolveHint("destination", "destinationHint");
@@ -2140,6 +2215,7 @@ function wire() {
 
   // One place that runs a search from the form, so the resume banner can reuse it.
   async function doSearch(opts) {
+    syncDateBounds(false);   // never search with a window that contradicts itself
     $("errorBox").style.display = "none";
     $("results").style.display = "none";
     $("resumeBox").style.display = "none";
@@ -2164,8 +2240,8 @@ function wire() {
     Promise.resolve(requestNotifyPermission()).then(syncNotifyStatus, () => {});
 
     const params = {
-      origin: $("origin").value.trim(),
-      destination: $("destination").value.trim(),
+      origin: $("origin").value.trim().toUpperCase(),
+      destination: $("destination").value.trim().toUpperCase(),
       min_days: parseInt($("min_days").value, 10) || 6,
       max_days: parseInt($("max_days").value, 10) || 7,
       date_from: $("date_from").value || null,

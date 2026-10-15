@@ -136,6 +136,9 @@ input:focus, select:focus {
   font-size: 0.78rem;
   color: var(--muted);
 }
+/* Capitals-only city/country fields: the value is upper-cased in JS as it is
+   typed, and this guarantees the *display* is capital even for autofill/paste. */
+.upper { text-transform: uppercase; }
 .resolve-hint .ok { color: var(--accent2); }
 .resolve-hint .err { color: var(--danger); }
 .btn {

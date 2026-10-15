@@ -90,6 +90,22 @@ Open the GitHub Pages URL, type a country/city/airport, pick your dates and stay
 You can also list several airports or cities directly, separated by commas or spaces —
 e.g. `DUS, FRA, HAM` (or `DUS FRA HAM`) — and every listed airport is searched.
 
+Two input rules keep the form from being filled in wrongly:
+
+- **The From/To fields are capitals-only.** Whatever you type (or paste) is turned into CAPITAL
+  letters as you go — `dus, fra` becomes `DUS, FRA`, `germany` becomes `GERMANY` — and the same
+  normalisation is applied to the submitted search, so resolution, hints and lookups always see
+  one casing. (`text-transform: uppercase` also keeps the *display* capital for autofill/paste,
+  and the mobile keyboard opens in caps mode.)
+- **The two date fields are the two ends of one window, so they cannot contradict each other.**
+  Picking a departure date (*Date window from*) immediately re-fills the return end
+  (*Date window to*) with **departure + the longest stay**, and the return calendar then only
+  offers days **after** the departure — earlier days *and* earlier months are greyed out and
+  cannot be selected. Symmetrically, the departure calendar is capped by the return end, and a
+  return end you picked yourself is never overwritten while it is still valid. So a departure of
+  `01.12.2026` gives a return end of `08.12.2026` with a 7-day maximum stay — never a month or a
+  date before the departure.
+
 ## The date window covers the whole trip (default)
 
 **Date window applies to → *Whole trip* (default).** Every flight listed both **departs and
