@@ -1842,58 +1842,121 @@ function _yymmdd(iso) {
   return m ? m[1].slice(2) + m[2] + m[3] : "";
 }
 
-/** True only when the option is a return to the same departure airport (so a
- *  single round-trip URL is faithful). Open-jaw returns from elsewhere. */
+/** True only when the option is a single round-trip booking that returns to the
+ *  same departure airport, so one round-trip URL is faithful. Separate one-way
+ *  tickets and open-jaw returns are two searches and are linked per leg. */
 function _isRoundTripLink(f) {
   return !!(f && f.return_date && f.return_date !== f.outbound_date && !f.open_jaw &&
+    f.ticket_type !== "oneway" &&
     (f.return_airport || f.origin_airport) === f.origin_airport);
 }
 
-function _kiwiCompareUrl(f, currency) {
-  if (!f || !f.origin_airport || !f.dest_airport || !f.outbound_date) return null;
+function _kiwiUrl(from, to, depDate, retDate, currency) {
+  if (!from || !to || !depDate) return null;
   const q = [
-    "from=" + encodeURIComponent(f.origin_airport),
-    "to=" + encodeURIComponent(f.dest_airport),
-    "departure=" + encodeURIComponent(f.outbound_date),
+    "from=" + encodeURIComponent(from),
+    "to=" + encodeURIComponent(to),
+    "departure=" + encodeURIComponent(depDate),
   ];
-  if (_isRoundTripLink(f)) q.push("return=" + encodeURIComponent(f.return_date));
+  if (retDate && retDate !== depDate) q.push("return=" + encodeURIComponent(retDate));
   q.push("adults=1", "lang=en");
   if (currency) q.push("currency=" + encodeURIComponent(currency));
   return "https://www.kiwi.com/deep?" + q.join("&");
 }
 
-function _skyscannerCompareUrl(f, directOnly) {
-  if (!f || !f.origin_airport || !f.dest_airport || !f.outbound_date) return null;
-  const o = String(f.origin_airport).toLowerCase();
-  const d = String(f.dest_airport).toLowerCase();
-  let u = `https://www.skyscanner.net/transport/flights/${o}/${d}/${_yymmdd(f.outbound_date)}`;
-  if (_isRoundTripLink(f)) u += `/${_yymmdd(f.return_date)}`;
+function _skyscannerUrl(from, to, depDate, retDate, directOnly) {
+  if (!from || !to || !depDate) return null;
+  let u = "https://www.skyscanner.net/transport/flights/" +
+    String(from).toLowerCase() + "/" + String(to).toLowerCase() + "/" + _yymmdd(depDate);
+  if (retDate && retDate !== depDate) u += "/" + _yymmdd(retDate);
   u += "/";
   const q = ["adults=1", "adultsv2=1"];
   if (directOnly) q.push("preferdirects=true");
   return u + "?" + q.join("&");
 }
 
-/** The whole "compare on other sites" card, built from one representative
- *  option (the cheapest overall). Returns "" when there is nothing to link. */
-function _compareLinksBlock(f, currency, directOnly) {
+/** A Google Flights results URL from an already-encoded `tfs` value. Google's
+ *  own result list is where the travel agents — Gotogate among them — appear
+ *  under “Booking options”, so this is the closest link to the same search. */
+function _googleFlightsUrl(tfs, currency) {
+  return "https://www.google.com/travel/flights?tfs=" + encodeURIComponent(tfs) +
+    "&hl=en&curr=" + encodeURIComponent(currency || "EUR");
+}
+
+/** One link pill. `sub` is a small qualifier (“out” / “back”); returns "" for a
+ *  missing href so callers can concatenate without checking. */
+function _cmpPill(text, sub, href, extraClass, title) {
+  if (!href) return "";
+  const subHtml = sub ? ` <span class="cmp-sub">${sub}</span>` : "";
+  const cls = "cmp-link" + (extraClass ? " " + extraClass : "");
+  const titleAttr = title ? ` title="${title}"` : "";
+  return `<a class="${cls}" href="${href}" target="_blank" rel="noopener noreferrer"${titleAttr}>${text}${subHtml} ↗</a>`;
+}
+
+const _GOTOGATE_URL = "https://www.gotogate.com/";
+const _GOTOGATE_TITLE = "Gotogate has no link that can prefill a search, so this opens its home " +
+  "page where you re-enter the route and dates.";
+
+/** One “compare” row for the cheapest option of one booking way. Google
+ *  Flights is linked for the exact search (its booking-options list carries the
+ *  OTAs, Gotogate included); Kiwi.com/Skyscanner are linked prefilled. A
+ *  two-one-way or open-jaw option is two tickets, so every site is linked once
+ *  per leg. */
+function _compareRow(f, currency, directOnly) {
   if (!f || !f.origin_airport || !f.dest_airport || !f.outbound_date) return "";
-  const route = `${f.origin_airport} → ${f.dest_airport}`;
-  const dates = _isRoundTripLink(f)
-    ? `${fmtDate(f.outbound_date)} – ${fmtDate(f.return_date)}`
-    : `${fmtDate(f.outbound_date)} · one-way${f.open_jaw ? " (open-jaw: outbound only)" : ""}`;
-  const links = [];
-  const kiwi = _kiwiCompareUrl(f, currency);
-  const sky = _skyscannerCompareUrl(f, directOnly);
-  if (kiwi) links.push(`<a class="cmp-link" href="${kiwi}" target="_blank" rel="noopener noreferrer">Kiwi.com ↗</a>`);
-  if (sky) links.push(`<a class="cmp-link" href="${sky}" target="_blank" rel="noopener noreferrer">Skyscanner ↗</a>`);
-  links.push(`<a class="cmp-link cmp-link-muted" href="https://www.gotogate.com/" target="_blank" rel="noopener noreferrer" ` +
-    `title="Gotogate has no link that can prefill a search, so this opens its home page where you re-enter the route and dates.">Gotogate ↗</a>`);
+  const roundTrip = _isRoundTripLink(f);
+  const maxStops = f.max_stops != null ? f.max_stops : (directOnly ? 0 : (f.open_jaw ? 1 : 2));
+  const leg = (from, to, date) => ({ from, to, date, maxStops, maxLayover: 180 });
+  const out = leg(f.origin_airport, f.dest_airport, f.outbound_date);
+  const back = f.return_date
+    ? leg(f.dest_airport, f.return_airport || f.origin_airport, f.return_date)
+    : null;
+
+  let pills = "";
+  if (roundTrip && back) {
+    pills += _cmpPill("Google Flights", "round-trip",
+      _googleFlightsUrl(buildTfs({ legs: [out, back], trip: "round-trip" }), currency), "cmp-link-primary");
+    pills += _cmpPill("Kiwi.com", "", _kiwiUrl(out.from, out.to, out.date, back.date, currency));
+    pills += _cmpPill("Skyscanner", "", _skyscannerUrl(out.from, out.to, out.date, back.date, directOnly));
+  } else {
+    pills += _cmpPill("Google Flights", back ? "out" : "",
+      _googleFlightsUrl(buildTfs({ legs: [out], trip: "one-way" }), currency), "cmp-link-primary");
+    if (back) pills += _cmpPill("Google Flights", "back",
+      _googleFlightsUrl(buildTfs({ legs: [back], trip: "one-way" }), currency), "cmp-link-primary");
+    pills += _cmpPill("Kiwi.com", back ? "out" : "", _kiwiUrl(out.from, out.to, out.date, null, currency));
+    if (back) pills += _cmpPill("Kiwi.com", "back", _kiwiUrl(back.from, back.to, back.date, null, currency));
+    pills += _cmpPill("Skyscanner", back ? "out" : "", _skyscannerUrl(out.from, out.to, out.date, null, directOnly));
+    if (back) pills += _cmpPill("Skyscanner", "back", _skyscannerUrl(back.from, back.to, back.date, null, directOnly));
+  }
+  pills += _cmpPill("Gotogate", "", _GOTOGATE_URL, "cmp-link-muted", _GOTOGATE_TITLE);
+
+  const route = `${out.from} → ${out.to}`;
+  const dates = back
+    ? `${fmtDate(out.date)} – ${fmtDate(back.date)}`
+    : `${fmtDate(out.date)} · one-way`;
+  const price = f.price != null ? ` · <strong>${f.price} ${currency || ""}</strong>` : "";
+  return `
+    <div class="compare-row">
+      <div class="compare-row-head">${_ticketLabel(f)} · <strong>${route}</strong> · ${dates}${price}</div>
+      <div class="compare-links">${pills}</div>
+    </div>`;
+}
+
+/** The whole “compare on other sites” card: one row per booking way, each the
+ *  cheapest option found for it. Returns "" when there is nothing to link. */
+function _compareCard(data, currency) {
+  const rows = [];
+  const rt = data.cheapest_roundtrip || data.cheapest_roundtrip_direct || null;
+  const ow = data.cheapest_oneway || data.cheapest_oneway_direct || null;
+  if (rt) rows.push(_compareRow(rt, currency, data.direct_only));
+  if (ow) rows.push(_compareRow(ow, currency, data.direct_only));
+  const body = rows.filter(Boolean).join("");
+  if (!body) return "";
   return `
     <div class="compare-card">
-      <div class="compare-title">Compare on other sites — <strong>${route}</strong> · ${dates}</div>
-      <div class="compare-links">${links.join("")}</div>
-      <div class="compare-note">Prefilled from the cheapest option found (route, dates, 1 adult). Kiwi.com and Skyscanner open that exact search; Gotogate cannot be prefilled by a link, so it opens its home page. Prices there are in that site's own currency and may differ from Google's.</div>
+      <div class="compare-title">Compare the cheapest options on other sites — Google Flights' result list is where the travel agents (Gotogate among them) appear</div>
+      ${body}
+      <div class="compare-note">Each row is the cheapest option found for that booking way. <strong>Google Flights</strong> opens that exact search — pick the flight there and its “Booking options” list the sellers (Gotogate among them). <strong>Kiwi.com</strong> and <strong>Skyscanner</strong> open a matching prefilled search; for a two-one-way or open-jaw option each leg is linked separately, because it is two tickets. <strong>Gotogate</strong> has no prefillable link, so it opens its home page. Prices elsewhere are in that site's own currency and may differ from Google's.</div>
     </div>`;
 }
 
@@ -1951,13 +2014,10 @@ function renderResults(data) {
 
   const ranked = data.ranked_options || [];
 
-  // Cross-site comparison card, built from the cheapest option found so the
-  // links point at the exact route + dates that produced the best price.
-  const bestForCompare = ranked.length
-    ? ranked[0]
-    : (data.cheapest_roundtrip || data.cheapest_oneway ||
-       data.cheapest_roundtrip_direct || data.cheapest_oneway_direct || null);
-  html += _compareLinksBlock(bestForCompare, cur, data.direct_only);
+  // Cross-site comparison card: one row per booking way, built from the
+  // cheapest option found for each, with Google Flights links where the travel
+  // agents (Gotogate among them) are listed.
+  html += _compareCard(data, cur);
 
   if (ranked.length) {
     const shown = ranked.length;
