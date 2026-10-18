@@ -2794,6 +2794,7 @@ function viewArchivedRun(aid, rid) {
   $("results").style.display = "block";
   autoStatus(`Showing the archived run from ${new Date(run.at).toLocaleString()}.`);
   try { if ($("results") && $("results").scrollIntoView) $("results").scrollIntoView({ behavior: "smooth", block: "start" }); } catch (e) {}
+  try { if ($("automationsCard")) $("automationsCard").open = false; } catch (e) {}
 }
 
 async function runAllEnabled() {
@@ -2942,22 +2943,23 @@ function saveAutoFromForm() {
   renderAutoCriteria();
   renderAutomations();
   autoStatus(`Saved “${a.name}” — every ${relMs(automationIntervalMs(a))}, ${nextRunText(a)}.`);
+  try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
 }
 
 function onAutomationListClick(e) {
-  const t = e.target && e.target.closest ? e.target.closest("button") : null;
+  const t = e.target && e.target.closest ? e.target.closest("button, [data-auto-view]") : null;
   if (!t) return;
-  const attr = (n) => t.getAttribute("data-auto-" + n);
+  if (t.hasAttribute && t.hasAttribute("data-auto-view") && t.getAttribute("data-auto-view")) {
+    const view = t.getAttribute("data-auto-view");
+    const parts = view.split("|");
+    if (parts.length === 2) return viewArchivedRun(parts[0], parts[1]);
+  }
+  const attr = (n) => (t.getAttribute && t.getAttribute("data-auto-" + n)) || null;
   if (attr("toggle")) return toggleAutomation(attr("toggle"));
   if (attr("run")) return runAutomationById(attr("run"), true);
   if (attr("edit")) return editAutomation(attr("edit"));
   if (attr("del")) return deleteAutomation(attr("del"));
   if (attr("export")) return exportAutomation(attr("export"));
-  const view = attr("view");
-  if (view) {
-    const parts = view.split("|");
-    return viewArchivedRun(parts[0], parts[1]);
-  }
 }
 
 /* ---------- rendering ---------- */
@@ -2985,15 +2987,21 @@ function refreshAutomationTimers() {
 
 function runRowHtml(a, run) {
   const s = run.summary || {};
-  let best;
-  if (!run.ok) best = `<span style="color:var(--danger)">failed: ${_esc(run.error || "error")}</span>`;
-  else if (s.best && s.best.price != null) {
+  let best, when;
+  if (!run.ok) {
+    best = `<span style="color:var(--danger)">failed: ${_esc(run.error || "error")}</span>`;
+    when = _esc(new Date(run.at).toLocaleString());
+  } else if (s.best && s.best.price != null) {
     best = `<strong>${s.best.price} ${_esc(s.currency || "")}</strong> · ${_esc(s.best.route)} · ${_esc(s.best.when)} · ${_esc(s.best.ticket || "")}`;
-  } else best = "no flights found";
+    when = _esc(new Date(run.at).toLocaleString()) + (run.tookMs ? ` · ${_esc(relMs(run.tookMs))}` : "");
+  } else {
+    best = "no flights found";
+    when = _esc(new Date(run.at).toLocaleString());
+  }
   const view = run.data
     ? `<button type="button" class="btn-mini ghost" data-auto-view="${a.id}|${run.id}">View results</button>` : "";
-  return `<div class="auto-run">
-    <span class="auto-run-when">${_esc(new Date(run.at).toLocaleString())}${run.tookMs ? ` · ${_esc(relMs(run.tookMs))}` : ""}</span>
+  return `<div class="auto-run" role="button" tabindex="0" data-auto-view="${a.id}|${run.id}">
+    <span class="auto-run-when">${when}</span>
     <span class="auto-run-best">${best}</span>
     ${run.stopped ? '<span class="auto-tag">stopped early</span>' : ""}
     ${view}
@@ -3004,10 +3012,18 @@ function automationCardHtml(a) {
   const enabled = a.enabled !== false;
   const runs = a.runs || [];
   const last = runs[0];
-  const lastTxt = !last ? "no runs yet" : `${new Date(last.at).toLocaleString()} — ${last.ok ? (last.stopped ? "stopped early" : "ok") : "failed"}`;
+  if (!last) {
+    lastTxt = "no runs yet";
+  } else if (!last.ok) {
+    lastTxt = `${new Date(last.at).toLocaleString()} — failed`;
+  } else if (last.summary && last.summary.best && last.summary.best.price != null) {
+    lastTxt = `${new Date(last.at).toLocaleString()} — cheapest ${last.summary.best.price} ${_esc(last.summary.currency || last.summary.best.currency || "")} ${last.summary.best.route ? "· " + _esc(last.summary.best.route) : ""}${last.stopped ? " (stopped early)" : ""}`;
+  } else {
+    lastTxt = `${new Date(last.at).toLocaleString()} — ok${last.stopped ? " (stopped early)" : ""}`;
+  }
   const win = (a.activeFrom && a.activeTo) ? ` · only ${_esc(a.activeFrom)}–${_esc(a.activeTo)}` : "";
   const history = runs.length
-    ? `<details class="auto-history"><summary>Archive — ${runs.length} run${runs.length === 1 ? "" : "s"} (last ${AUTOMATION_RUNS_KEPT} kept)</summary>${runs.map((r) => runRowHtml(a, r)).join("")}</details>`
+    ? `<details class="auto-history" open><summary>Archive — ${runs.length} run${runs.length === 1 ? "" : "s"} (last ${AUTOMATION_RUNS_KEPT} kept)</summary>${runs.map((r) => runRowHtml(a, r)).join("")}</details>`
     : `<p class="auto-empty">No runs archived yet.</p>`;
   return `<div class="auto-item ${enabled ? "" : "off"}">
     <div class="auto-item-top">
@@ -3040,28 +3056,38 @@ function renderAutomations() {
 /* ---------- scheduler ---------- */
 function automationTick() {
   refreshAutomationTimers();
+  if (_automationTickTimer) { /* already scheduled */ }
   if (!_automations.length || _searchInFlight) return;
   // Resolving airport names needs the airport data, so wait until it is loaded.
   if (!Object.keys(AIRPORTS).length) return;
   const now = Date.now();
   const due = _automations.find((a) => a.enabled !== false && automationNextRunAt(a) <= now);
-  if (due) runAutomationById(due.id, false);
+  runAutomationById(due.id, false);
 }
 
 function initAutomations() {
   if (!$("automationList")) return;
   loadAutomations();
   resetAutoForm();
+  _autoDraftParams = readFormParams();
   renderAutoCriteria();
   renderAutomations();
 
   $("automationList").addEventListener("click", onAutomationListClick);
-  if ($("autoCapture")) $("autoCapture").addEventListener("click", () => {
-    _autoDraftParams = readFormParams();
-    renderAutoCriteria();
-    autoStatus("Criteria captured from the form above.");
+  if ($("autoCapture")) {
+    $("autoCapture").addEventListener("click", () => {
+      _autoDraftParams = readFormParams();
+      renderAutoCriteria();
+      autoStatus("Criteria captured from the form above.");
+      try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
+    });
+  } else if ($("autoSave")) {
+    // If "Use current form criteria" is missing, Save still captures the form.
+  }
+  if ($("autoSave")) $("autoSave").addEventListener("click", () => {
+    if (!_autoDraftParams) _autoDraftParams = readFormParams();
+    saveAutoFromForm();
   });
-  if ($("autoSave")) $("autoSave").addEventListener("click", saveAutoFromForm);
   if ($("autoCancel")) $("autoCancel").addEventListener("click", () => {
     _editingAutomationId = null;
     _autoDraftParams = null;
@@ -3081,6 +3107,9 @@ function initAutomations() {
 
   if (_automationTickTimer) clearInterval(_automationTickTimer);
   _automationTickTimer = setInterval(automationTick, AUTOMATION_TICK_MS);
+  // Run the first tick soon after init so any overdue automations (e.g. missed
+  // while the tab was closed) fire promptly without waiting for the first 20s.
+  try { setTimeout(() => { try { automationTick(); } catch (e) {} }, 250); } catch (e) {}
   refreshAutomationTimers();
 }
 
