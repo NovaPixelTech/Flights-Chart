@@ -969,6 +969,48 @@ async function searchOpenJaw(task, currency) {
 }
 
 /**
+ * Separate one-ways: the cheapest one-way out plus the cheapest one-way back,
+ * summed. These are two independent tickets (often two airlines), so the total
+ * is reported distinctly from Google's single round-trip fare for the same
+ * dates — it is frequently cheaper, which is exactly the confusion this mode
+ * exists to make visible.
+ */
+async function searchOneWayCombo(task, currency) {
+  const maxStops = task.maxStops != null ? task.maxStops : 2;
+  const [outOptions, retOptions] = await Promise.all([
+    fetchOneWayOptions(task.origin, task.dest, task.outbound, maxStops, currency),
+    fetchOneWayOptions(task.dest, task.origin, task.ret, maxStops, currency),
+  ]);
+  const usable = (d) => d.price != null &&
+    !(maxStops === 0 && d.stops > 0) &&
+    !(d.stops > 0 && d.layovers_min.some((l) => l > 180));
+  const bestOut = outOptions.filter(usable).sort((a, b) => a.price - b.price)[0];
+  const bestRet = retOptions.filter(usable).sort((a, b) => a.price - b.price)[0];
+  if (!bestOut || !bestRet) return [];
+  return [{
+    price: bestOut.price + bestRet.price,
+    airlines: Array.from(new Set([...(bestOut.airlines || []), ...(bestRet.airlines || [])])),
+    stops: bestOut.stops,
+    legs: bestOut.legs,
+    return_legs: bestRet.legs,
+    layovers_min: bestOut.layovers_min,
+    return_layovers_min: bestRet.layovers_min,
+    total_duration_min: bestOut.total_duration_min,
+    return_airlines: bestRet.airlines,
+    return_stops: bestRet.stops,
+    return_duration_min: bestRet.total_duration_min,
+    origin_airport: task.origin,
+    return_airport: task.origin,
+    dest_airport: task.dest,
+    outbound_date: task.outbound,
+    return_date: task.ret,
+    stay_days: task.stay,
+    ticket_type: "oneway",
+    open_jaw: false,
+  }];
+}
+
+/**
  * Run the whole search. `params` mirrors the old backend payload.
  * `onProgress` is called after every completed lookup so the UI can stream.
  */
@@ -1042,6 +1084,16 @@ async function runSearch(params, onProgress, opts) {
 
   const currency = params.currency || "USD";
 
+  // Which booking style(s) to price. "roundtrip" = Google's single round-trip
+  // fare; "oneway" = cheapest one-way out + cheapest one-way back (two tickets);
+  // "both" = run and report each. `lookupsPerSlot` is how many scheduled
+  // lookups a (pair × stay × date) slot costs, so the ceiling/coverage math
+  // stays truthful when both are asked for.
+  const ticketType = params.ticket_type || "roundtrip";
+  const wantRoundTrip = ticketType !== "oneway";
+  const wantOneWays = ticketType === "oneway" || ticketType === "both";
+  const lookupsPerSlot = (wantRoundTrip ? 1 : 0) + (wantOneWays ? 1 : 0);
+
   // ---- plan the sweep ----
   // One "route" = an origin→destination airport pair × a stay length; one
   // "lookup" = a route on one calendar day (each lookup is a single reader
@@ -1076,17 +1128,19 @@ async function runSearch(params, onProgress, opts) {
   let nPairs = pairsWanted;
   // Keep as many airport pairs as fit; the cap is a floor for pair coverage, so
   // it is only ever reduced when the pair list alone exceeds the whole budget.
-  if (nPairs * nStays > requestedCeiling && requestedCeiling > 0) {
-    nPairs = Math.max(1, Math.floor(requestedCeiling / nStays));
+  if (nPairs * nStays * lookupsPerSlot > requestedCeiling && requestedCeiling > 0) {
+    nPairs = Math.max(1, Math.floor(requestedCeiling / (nStays * lookupsPerSlot)));
   }
-  if (exhaustive && nPairs * nStays > safetyCap) {
-    nPairs = Math.max(1, Math.floor(safetyCap / nStays));
+  if (exhaustive && nPairs * nStays * lookupsPerSlot > safetyCap) {
+    nPairs = Math.max(1, Math.floor(safetyCap / (nStays * lookupsPerSlot)));
   }
   const routePairs = pairs.slice(0, nPairs);
-  const routeCount = Math.max(1, routePairs.length * nStays);
+  const routeCount = Math.max(1, routePairs.length * nStays * lookupsPerSlot);
 
-  // The real grid: every surviving (stay, departure date) slot × every pair.
-  const fullGrid = routePairs.length * stayDateSlots;
+  // The real grid: every surviving (stay, departure date) slot × every pair,
+  // times the number of lookups a slot costs (1, or 2 when both ticket types
+  // are priced).
+  const fullGrid = routePairs.length * stayDateSlots * lookupsPerSlot;
   const lookupCeiling = exhaustive
     ? Math.max(1, Math.min(fullGrid, safetyCap))
     : Math.max(1, Math.min(requestedCeiling, 50000));
@@ -1123,6 +1177,24 @@ async function runSearch(params, onProgress, opts) {
       maxStops: maxStopsForSearch,
     };
   };
+  const owTask = (origin, dest, outbound, stay) => {
+    searchedOrigins.add(origin);
+    return {
+      kind: "ow", origin, dest, outbound,
+      ret: isoLocal(addDays(parseISODate(outbound), stay)), stay,
+      maxStops: maxStopsForSearch,
+    };
+  };
+  /** The round-trip and/or separate-one-way lookups for one (pair, stay, date). */
+  const slotTasks = (origin, dest, outbound, stay) => {
+    const out = [];
+    if (wantRoundTrip) out.push(rtTask(origin, dest, outbound, stay));
+    if (wantOneWays) out.push(owTask(origin, dest, outbound, stay));
+    return out;
+  };
+  // A separate-one-way lookup makes two reader requests (one per direction), a
+  // round-trip lookup one; used for the ETA. Open-jaw is also two directions.
+  const taskFetches = (t) => (t.kind === "rt" ? 1 : 2);
 
   // ---- resume support: a long exhaustive sweep may outlive the tab ----
   // Progress is checkpointed in localStorage, and a resumed run skips the
@@ -1132,7 +1204,7 @@ async function runSearch(params, onProgress, opts) {
   const finishedKeys = new Set(alreadyDone);
   const taskId = (t) => (t.kind === "oj"
     ? `oj|${t.o_out}|${t.o_ret}|${t.dest}|${t.outbound}|${t.stay}`
-    : sweepKey(t.origin, t.dest, t.stay, t.outbound));
+    : `${t.kind}|${sweepKey(t.origin, t.dest, t.stay, t.outbound)}`);
   const pendingOnly = (list) => (alreadyDone.size ? list.filter((t) => !alreadyDone.has(taskId(t))) : list);
 
   // ---- pass 1: broad grid, every route on its broad dates ----
@@ -1148,7 +1220,7 @@ async function runSearch(params, onProgress, opts) {
   for (const outbound of bisectionOrder(broadDatesUnion)) {
     for (const pair of routePairs) {
       for (const p of stayPlan) {
-        if (broadSetFor.get(p.stay).has(outbound)) broadTasks.push(rtTask(pair[0], pair[1], outbound, p.stay));
+        if (broadSetFor.get(p.stay).has(outbound)) broadTasks.push(...slotTasks(pair[0], pair[1], outbound, p.stay));
       }
     }
   }
@@ -1179,7 +1251,16 @@ async function runSearch(params, onProgress, opts) {
 
   const broadPending = pendingOnly(broadTasks);
   const ojPending = pendingOnly(ojTasks);
-  const planned = { sweep: broadPending.length + ojPending.length, deep: 0, returns: 0 };
+  // `sweep`/`deep` count lookups (one per scheduled slot-lookup) for the
+  // progress line; `fetches`/`deepFetches` count reader requests for the ETA
+  // (a separate-one-way or open-jaw lookup is two requests).
+  const planned = {
+    sweep: broadPending.length + ojPending.length,
+    deep: 0,
+    deepFetches: 0,
+    returns: 0,
+    fetches: [...broadPending, ...ojPending].reduce((n, t) => n + taskFetches(t), 0),
+  };
 
   // ---- execute with a small worker pool ----
   const all = [];
@@ -1199,7 +1280,7 @@ async function runSearch(params, onProgress, opts) {
   // request count divided by that rate. SEARCH_TIME_BUDGET_MS=0 means "no time
   // limit" — a long exhaustive sweep is meant to finish, not to be cut off.
   const requestedTotal = () =>
-    (planned.sweep + planned.deep) + Math.min(returnLimit, planned.returns || returnLimit);
+    (planned.fetches + (planned.deepFetches || 0)) + Math.min(returnLimit, planned.returns || returnLimit);
   const configuredBudget = Number(window.SEARCH_TIME_BUDGET_MS);
   const noTimeLimit = !Number.isFinite(configuredBudget) || configuredBudget <= 0;
   const timeBudgetMs = () =>
@@ -1241,11 +1322,11 @@ async function runSearch(params, onProgress, opts) {
     all.push(f);
     const bucket = perOrigin[f.origin_airport];
     if (bucket) {
-      const isDirect = !f.open_jaw && f.stops === 0;
+      const isDirect = _isDirectOption(f);
       const upd = (cur) => (cur == null || (f.price != null && (cur.price == null || f.price < cur.price)) ? f : cur);
       bucket.any = upd(bucket.any);
       if (isDirect) bucket.direct = upd(bucket.direct);
-      if (f.stops > 0 || f.open_jaw) bucket.connecting = upd(bucket.connecting);
+      else bucket.connecting = upd(bucket.connecting);
     }
   }
 
@@ -1304,7 +1385,9 @@ async function runSearch(params, onProgress, opts) {
         try {
           const found = task.kind === "oj"
             ? await searchOpenJaw(task, currency)
-            : await searchOneRoute(task, currency, { withReturn: false });
+            : task.kind === "ow"
+              ? await searchOneWayCombo(task, currency)
+              : await searchOneRoute(task, currency, { withReturn: false });
           for (const f of found) record(f);
           finishedKeys.add(taskId(task));
           if (++sinceCheckpoint >= CHECKPOINT_EVERY) { sinceCheckpoint = 0; checkpoint(); }
@@ -1378,14 +1461,14 @@ async function runSearch(params, onProgress, opts) {
       .filter((p) => missingPerStay.get(p.stay).includes(date))
       .map((p) => p.stay);
     const minGroup = missingDates.length
-      ? Math.min.apply(null, missingDates.map((d) => missingStaysFor(d).length))
-      : 1;
+      ? Math.max(1, Math.min.apply(null, missingDates.map((d) => missingStaysFor(d).length)) * lookupsPerSlot)
+      : lookupsPerSlot;
     const deepTasks = [];
     const deepPairs = new Map();
     let room = lookupCeiling - broadTasks.length - ojTasks.length;
     for (const pair of rankedPairs) {
       if (room <= 0) break;
-      const deficit = stayPlan.reduce((n, p) => n + missingPerStay.get(p.stay).length, 0);
+      const deficit = stayPlan.reduce((n, p) => n + missingPerStay.get(p.stay).length, 0) * lookupsPerSlot;
       const reserve = rankedPairs.length > 1 ? Math.ceil(room * 0.2) : 0;
       let share = room - reserve >= deficit ? deficit : Math.max(minGroup, Math.ceil((room - reserve) * 0.8));
       share = Math.min(share, room);
@@ -1395,12 +1478,14 @@ async function runSearch(params, onProgress, opts) {
       for (const outbound of missingDates) {
         const group = missingStaysFor(outbound);
         if (!group.length) continue;
-        if (share < group.length || room < group.length) continue; // whole days only
+        const need = group.length * lookupsPerSlot;
+        if (share < need || room < need) continue; // whole days only
         for (const stay of group) {
-          deepTasks.push(rtTask(pair[0], pair[1], outbound, stay));
-          share--;
-          room--;
-          spent++;
+          const tasks = slotTasks(pair[0], pair[1], outbound, stay);
+          for (const t of tasks) deepTasks.push(t);
+          share -= tasks.length;
+          room -= tasks.length;
+          spent += tasks.length;
           taken.get(stay).add(outbound);
         }
       }
@@ -1419,13 +1504,23 @@ async function runSearch(params, onProgress, opts) {
     const deepPending = pendingOnly(deepTasks);
     if (deepPending.length) {
       planned.deep = deepPending.length;
+      planned.deepFetches = deepPending.reduce((n, t) => n + taskFetches(t), 0);
       await runPass(deepPending, "every day");
     }
   }
 
   all.sort((a, b) => (a.price ?? 1e9) - (b.price ?? 1e9));
-  const directs = all.filter((r) => !r.open_jaw && r.stops === 0);
-  const connecting = all.filter((r) => r.stops > 0 || r.open_jaw);
+  const directs = all.filter((r) => _isDirectOption(r));
+  const connecting = all.filter((r) => !_isDirectOption(r));
+  // Split by booking style so each can be reported in its own section. Open-jaw
+  // is also two separate tickets (different airports), so it rides with the
+  // separate-one-way group and is labelled as such per row.
+  const roundTripOpts = all.filter((r) => !r.open_jaw && r.ticket_type !== "oneway");
+  const oneWayOpts = all.filter((r) => r.open_jaw || r.ticket_type === "oneway");
+  const cheapestRoundTrip = roundTripOpts[0] || null;
+  const cheapestRoundTripDirect = roundTripOpts.find((r) => _isDirectOption(r)) || null;
+  const cheapestOneWay = oneWayOpts[0] || null;
+  const cheapestOneWayDirect = oneWayOpts.find((r) => _isDirectOption(r)) || null;
 
   // cheapest option found for each outbound date we actually queried
   const perDate = {};
@@ -1475,15 +1570,17 @@ async function runSearch(params, onProgress, opts) {
   window._stopRequested = false;
 
   // ---- what was ACTUALLY swept (planned vs finished differ when stopped) ----
-  // Every finished lookup contributes one key, "origin|dest|stay|date" for grid
-  // lookups ("oj|…" keys are open-jaw tasks, which are not part of the grid), so
-  // the reported coverage is measured, never claimed from the plan.
+  // Every finished lookup contributes one key — "rt|origin|dest|stay|date" for a
+  // round-trip lookup or "ow|…" for a separate-one-way lookup ("oj|…" keys are
+  // open-jaw tasks, which are not part of the grid). The booking prefix is
+  // stripped so coverage is measured on the grid slot, never claimed from the plan.
   const sweptPairs = new Set();
   const sweptStays = new Set();
   const sweptDates = new Set();
   const sweptRouteDates = new Map(); // "origin|dest|stay" -> Set(dates)
-  for (const k of finishedKeys) {
+  for (let k of finishedKeys) {
     if (typeof k !== "string" || k.startsWith("oj|")) continue;
+    if (k.startsWith("rt|") || k.startsWith("ow|")) k = k.slice(3);
     const [o, d, s, date] = k.split("|");
     if (!date) continue;
     sweptPairs.add(`${o}|${d}`);
@@ -1536,6 +1633,8 @@ async function runSearch(params, onProgress, opts) {
     sample_outbounds: datesChecked,
     currency,
     direct_only: !!params.direct_only,
+    ticket_type: ticketType,
+    lookups_per_slot: lookupsPerSlot,
     searches_performed: done,
     lookup_errors: errors,
     stopped_early: stopped || done < planned.sweep + planned.deep,
@@ -1565,6 +1664,12 @@ async function runSearch(params, onProgress, opts) {
     reader_rate_per_minute: _readerRate(),
     cheapest_direct: directs[0] || null,
     cheapest_with_stops: connecting[0] || null,
+    cheapest_roundtrip: cheapestRoundTrip,
+    cheapest_roundtrip_direct: cheapestRoundTripDirect,
+    cheapest_oneway: cheapestOneWay,
+    cheapest_oneway_direct: cheapestOneWayDirect,
+    has_roundtrip_results: roundTripOpts.length > 0,
+    has_oneway_results: oneWayOpts.length > 0,
     ranked_options: all.slice(0, 50),
     per_date_summary: perDateList,
     per_origin_summary: perOriginList,
@@ -1593,9 +1698,14 @@ async function runSearch(params, onProgress, opts) {
       `${_readerRate()} a minute per visitor and the sweep is queued under that rate, so a big run takes a while — ` +
       "the progress line shows the wait, the elapsed time and an ETA, and it is checkpointed so a reload can resume it. " +
       "A free reader API key in ⚙️ settings removes the wait. " +
-      "Round-trip prices are Google's own totals for the exact pair of dates (outbound + stay); Google's round-trip " +
-      "page lists only the outbound itinerary, so the return flight shown is the cheapest return on that same date " +
-      `(same airline when available), fetched separately for the flights on display (up to ${returnLimit}). ` +
+      "Round-trip prices are Google's own single-ticket totals for the exact pair of dates (outbound + stay); Google's " +
+      "round-trip page lists only the outbound itinerary, so the return flight shown is the cheapest return on that " +
+      `same date (same airline when available), fetched separately for the flights on display (up to ${returnLimit}). ` +
+      (wantOneWays
+        ? "Separate one-way totals are the cheapest one-way out plus the cheapest one-way back for those dates — two " +
+          "independent tickets (often two airlines), so they can undercut the round-trip fare but come with separate " +
+          "baggage/change rules. "
+        : "") +
       (params.direct_only ? "Only nonstop itineraries were requested. " : "") +
       "Open-jaw totals are estimated from two separate one-ways.",
   };
@@ -1604,11 +1714,27 @@ async function runSearch(params, onProgress, opts) {
 /* ------------------------------------------------------------------ *
  *  Rendering
  * ------------------------------------------------------------------ */
+/** Human label for how an option is booked. */
+function _ticketLabel(f) {
+  if (f.open_jaw) return "Open-jaw (two one-ways)";
+  if (f.ticket_type === "oneway") return "Two one-way tickets";
+  return "Round-trip ticket";
+}
+
+/**
+ * True when every itinerary an option contains is nonstop: the outbound, and
+ * for a two-one-way combo the return as well (open-jaw is never "direct").
+ */
+function _isDirectOption(f) {
+  if (f.open_jaw || f.stops !== 0) return false;
+  if (f.ticket_type === "oneway" && f.return_stops != null && f.return_stops !== 0) return false;
+  return true;
+}
+
 function renderFlight(f, badgeClass, badgeText) {
   if (!f) return "";
   const out = _dirSummary(f.legs, f.airlines, f.stops);
   const ret = f.return_legs ? _dirSummary(f.return_legs, f.return_airlines, f.return_stops) : null;
-  const oj = f.open_jaw ? " · Open-jaw" : "";
   let html = `
     <div class="flight-card ${badgeClass}">
       <span class="badge ${badgeClass === "best-direct" ? "green" : "blue"}">${badgeText}</span>
@@ -1641,7 +1767,7 @@ function renderFlight(f, badgeClass, badgeText) {
   html += `
       <div class="meta">Flight time: outbound ${formatDuration(f.total_duration_min)}` +
     (f.return_duration_min != null ? ` · return ${formatDuration(f.return_duration_min)}` : "") +
-    `${oj}</div>
+    ` · ${_ticketLabel(f)}</div>
     </div>`;
   return html;
 }
@@ -1707,6 +1833,7 @@ function renderResults(data) {
     <span><strong>${data.origin_input}</strong> → <strong>${data.destination_input}</strong></span>
     <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
     <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days${data.window_mode === "depart" ? " · window = departure date" : " · whole trip inside the window"}</span>
+    ${data.ticket_type ? `<span>Ticket: <strong>${data.ticket_type === "both" ? "round-trip + two separate one-ways" : data.ticket_type === "oneway" ? "two separate one-ways" : "round-trip"}</strong></span>` : ""}
     ${data.direct_only ? `<span>Direct (nonstop) only</span>` : ""}
     <span>${data.searches_performed || 0} lookups · ${data.all_results_count || 0} options found${data.stopped_early ? (data.stopped_by_user ? " · partial (stopped by you)" : " · partial (time limit)") : ""}</span>
     ${data.exhaustive && !data.safety_capped && !data.stopped_early
@@ -1724,8 +1851,32 @@ function renderResults(data) {
 
   const cur = data.currency || window._currency || "";
   let html = "";
-  if (data.cheapest_direct) html += renderFlight(data.cheapest_direct, "best-direct", "Cheapest direct");
-  if (data.cheapest_with_stops) html += renderFlight(data.cheapest_with_stops, "best-stops", "Cheapest ≤2 stops / open-jaw");
+
+  // One section per booking style, so the single round-trip fare and the
+  // separately-booked two-one-way total are never conflated — that confusion
+  // is exactly what this split exists to prevent.
+  const bookSections = [];
+  if (data.has_roundtrip_results) {
+    const rows = [];
+    if (data.cheapest_roundtrip_direct) rows.push(renderFlight(data.cheapest_roundtrip_direct, "best-direct", "Round-trip · cheapest direct"));
+    if (data.cheapest_roundtrip && data.cheapest_roundtrip !== data.cheapest_roundtrip_direct) {
+      rows.push(renderFlight(data.cheapest_roundtrip, "best-stops", "Round-trip · cheapest overall"));
+    }
+    if (rows.length) {
+      bookSections.push(`<div class="section-title">Round-trip ticket — one booking, Google's round-trip total</div>${rows.join("")}`);
+    }
+  }
+  if (data.has_oneway_results) {
+    const rows = [];
+    if (data.cheapest_oneway_direct) rows.push(renderFlight(data.cheapest_oneway_direct, "best-direct", "Two one-ways · cheapest direct"));
+    if (data.cheapest_oneway && data.cheapest_oneway !== data.cheapest_oneway_direct) {
+      rows.push(renderFlight(data.cheapest_oneway, "best-stops", "Two one-ways · cheapest overall"));
+    }
+    if (rows.length) {
+      bookSections.push(`<div class="section-title">Two separate one-way tickets — two bookings (cheapest out + cheapest back)</div>${rows.join("")}`);
+    }
+  }
+  html += bookSections.join("");
 
   const ranked = data.ranked_options || [];
   if (ranked.length) {
@@ -1736,7 +1887,7 @@ function renderResults(data) {
       <th>#</th><th>Price</th><th>Outbound flight</th><th>Return flight</th><th>Stay</th><th>Type</th>
     </tr></thead><tbody>`;
     ranked.forEach((f, i) => {
-      const type = f.open_jaw ? "Open-jaw" : "Round-trip";
+      const type = _ticketLabel(f).replace(" (two one-ways)", "");
       html += `<tr>
         <td class="rank-cell">${i + 1}</td>
         <td class="price-cell">${f.price != null ? f.price + " " + cur : "—"}</td>
@@ -2082,6 +2233,7 @@ function applyParamsToForm(p) {
   set("window_mode", p.window_mode || "trip");
   set("currency", p.currency);
   set("open_jaw", p.open_jaw ? "true" : "false");
+  set("ticket_type", p.ticket_type);
   const dc = $("direct_only");
   if (dc) dc.checked = !!p.direct_only;
   syncDateBounds(false);
@@ -2250,6 +2402,7 @@ function wire() {
       window_mode: $("window_mode") ? $("window_mode").value : "trip",
       currency: $("currency").value,
       open_jaw: $("open_jaw").value === "true",
+      ticket_type: $("ticket_type") ? $("ticket_type").value : "roundtrip",
       direct_only: $("direct_only") ? $("direct_only").checked : false,
     };
     window._currency = params.currency;

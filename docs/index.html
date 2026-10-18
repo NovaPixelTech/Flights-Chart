@@ -46,7 +46,7 @@
         </svg>
         <span>Cheap Flights Finder</span>
       </h1>
-      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Open-jaw supported · Direct-only filter · Outbound <em>and</em> return details · Runs in the background and notifies you when it's done</p>
+      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Round-trip <em>or</em> two separate one-ways (compared) · Open-jaw supported · Direct-only filter · Outbound <em>and</em> return details · Runs in the background and notifies you when it's done</p>
       <div class="status-row">
         <span class="pill" id="dataPill"><span class="dot"></span><span id="dataPillText">data: live Google Flights</span></span>
         <span class="pill" id="airportPill"><span class="dot"></span><span id="airportPillText">airports: loading…</span></span>
@@ -122,6 +122,19 @@
               <option value="true">Yes</option>
               <option value="false">No (same airport return)</option>
             </select>
+          </div>
+          <div class="full">
+            <label for="ticket_type">Ticket type</label>
+            <select id="ticket_type" name="ticket_type">
+              <option value="both" selected>Both — round-trip vs. two separate one-ways (compare)</option>
+              <option value="roundtrip">Round-trip ticket only (one booking)</option>
+              <option value="oneway">Two separate one-ways only (cheapest combo, two bookings)</option>
+            </select>
+            <div class="resolve-hint">A <strong>round-trip ticket</strong> is a single booking with Google's own
+              round-trip total. <strong>Two separate one-ways</strong> sums the cheapest one-way out and the cheapest
+              one-way back — often cheaper, but it is two tickets (possibly two different airlines) booked
+              separately, each with its own baggage/change rules. <strong>Both</strong> searches and reports each,
+              in its own section, so you can compare. Searching both costs extra lookups.</div>
           </div>
           <div class="full">
             <label class="inline-check" for="direct_only">

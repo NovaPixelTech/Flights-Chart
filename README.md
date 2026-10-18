@@ -2,6 +2,10 @@
 
 Web app that finds the **cheapest direct flight** and the **cheapest flight with at most
 2 stops** (stopover ≤ 3 hours) between two cities/airports for a vacation of a given length.
+Each trip can be priced as a **single round-trip ticket** or as **two separately-booked
+one-ways** (the cheapest one-way out plus the cheapest one-way back — often cheaper, because it
+can mix airlines), or **both at once** and shown in their own sections so the two booking styles
+are never conflated.
 Supports country inputs (expands to **every** commercial airport in that country — all of them
 are searched), explicit airport lists (`DUS, FRA, HAM`), flexible date windows, stay-length
 ranges, open-jaw (different return airport), and an optional **direct-only (nonstop)** filter.
@@ -246,6 +250,47 @@ Earlier versions of this app used a Flask backend (`app.py`) that scrapes Google
 `fast-flights` and serves JSON over CORS. That path still works if you prefer to run your own
 backend (Docker, Vercel, a VPS, …) — see `Dockerfile`, `requirements.txt` and `vercel.json` —
 but it is **no longer required**: the GitHub Pages app above is fully self-contained.
+
+### ⚠️ The Python backend does **not** have the "ticket type" feature yet
+
+The static app (`docs/`) gained a **Round-trip vs. two separate one-ways** comparison, but
+`app.py` + `templates/index.html` were intentionally left untouched (it is the legacy path).
+If you ever want the Flask backend to match, here is exactly what to change — the static app is
+the reference implementation, so mirror it rather than inventing a new design.
+
+**Concept.** A *round-trip ticket* is a single booking priced from Google's round-trip response.
+*Two separate one-ways* is the sum of the cheapest one-way in each direction (often two different
+airlines, so it can be cheaper). They are different products and must never be added or compared
+as if they were the same thing.
+
+**Backend (`app.py`)**
+
+- Read a new request field in `api_search()`: `ticket_type` ∈ `"roundtrip" | "oneway" | "both"`
+  (default `"roundtrip"` so existing callers are unaffected).
+- For each `(origin, dest, outbound, stay)` slot the loop already computes, keep the existing
+  round-trip call for `roundtrip`/`both`, and additionally, for `oneway`/`both`, call
+  `search_flights(o, d, outbound, None, …)` and `search_flights(d, o, ret, None, …)` (i.e. two
+  **one-way** searches — `return_date=None`). Sum the two cheapest, tag the merged record with
+  `ticket_type: "oneway"` (or `"open_jaw"` for the existing open-jaw estimate), and append it.
+  A one-way combo is **two** `search_flights` calls, so count it against `MAX_SEARCHES` as two.
+- Tag round-trip records with `ticket_type: "roundtrip"`.
+- In the JSON response, add `ticket_type`, plus `cheapest_roundtrip` / `cheapest_roundtrip_direct`
+  and `cheapest_oneway` / `cheapest_oneway_direct` (filter `all_results` by `ticket_type`, then by
+  nonstop), and `has_roundtrip_results` / `has_oneway_results`, mirroring
+  `docs/app.js` → `runSearch()` (search for `roundTripOpts`, `oneWayOpts`).
+- "Direct" for a one-way combo means **both** legs are nonstop (`stops == 0` and
+  `return_stops == 0`), matching `docs/app.js` → `_isDirectOption()`.
+
+**Frontend (`templates/index.html`)**
+
+- Add a `ticket_type` `<select>` next to the existing `open_jaw` control (same three options,
+  default `both`), include it in the `fetch("/api/search", …)` body, and render the two sections
+  ("Round-trip ticket — one booking" / "Two separate one-way tickets — two bookings") plus the
+  Type column, exactly like `renderResults()` / `_ticketLabel()` in `docs/app.js`.
+
+**Caveat.** `app.py` runs synchronously under a hard `MAX_SEARCHES` (default 40) and
+`SEARCH_TIME_BUDGET_S` (default 100s) budget on a free host; `"both"` roughly doubles the work,
+so consider leaving the backend default at `"roundtrip"` and letting the client opt in.
 
 ## Example
 
