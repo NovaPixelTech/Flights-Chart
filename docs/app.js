@@ -2379,6 +2379,711 @@ function applyParamsToForm(p) {
   syncDateBounds(false);
 }
 
+/** The search parameters exactly as they stand in the form right now. Shared by
+ *  the manual search and by automations' “Use current form criteria”. */
+function readFormParams() {
+  return {
+    origin: $("origin").value.trim().toUpperCase(),
+    destination: $("destination").value.trim().toUpperCase(),
+    min_days: parseInt($("min_days").value, 10) || 6,
+    max_days: parseInt($("max_days").value, 10) || 7,
+    date_from: $("date_from").value || null,
+    date_to: $("date_to").value || null,
+    date_mode: $("date_mode") ? $("date_mode").value : "sampled",
+    window_mode: $("window_mode") ? $("window_mode").value : "trip",
+    currency: $("currency").value,
+    open_jaw: $("open_jaw").value === "true",
+    ticket_type: $("ticket_type") ? $("ticket_type").value : "roundtrip",
+    direct_only: $("direct_only") ? $("direct_only").checked : false,
+  };
+}
+
+/* ==================================================================== *
+ *  Automations — scheduled re-runs with a per-run archive
+ *
+ *  A 100%-static page cannot run while it is closed, so an automation is a
+ *  scheduler that lives in this tab: a tick checks which automations are due,
+ *  runs ONE search at a time on the same engine the form uses (so the reader
+ *  quota is shared, never doubled), then notifies you and archives that run's
+ *  full results list. The last AUTOMATION_RUNS_KEPT runs are kept per
+ *  automation. A missed slot is not replayed N times — when the tab next
+ *  opens, a due automation runs once, immediately.
+ * ==================================================================== */
+const AUTOMATIONS_KEY = "flightschart.automations.v1";
+const AUTOMATION_RUNS_KEPT = 24;
+const AUTOMATION_TICK_MS = 20000;
+
+let _automations = [];
+let _automationRunningId = null;   // id of the automation running right now
+let _automationRunPromise = null;  // resolves when that run finishes
+let _automationTickTimer = null;
+let _searchInFlight = false;       // shared lock: a manual search OR an automation run
+let _editingAutomationId = null;
+let _autoDraftParams = null;       // criteria captured into the form, not yet saved
+
+function newId() {
+  return "auto_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+}
+
+function _esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function autoStatus(text) {
+  const el = $("autoStatus");
+  if (el) el.textContent = text || "";
+}
+
+/* ---------- storage ---------- */
+function loadAutomations() {
+  let list = [];
+  try {
+    const raw = window.localStorage && window.localStorage.getItem(AUTOMATIONS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && Array.isArray(parsed.automations)) list = parsed.automations;
+  } catch (e) { list = []; }
+  _automations = list.filter((a) => a && typeof a === "object");
+  _automations.forEach((a) => {
+    if (!a.id) a.id = newId();
+    if (!a.params || typeof a.params !== "object") a.params = {};
+    if (!Array.isArray(a.runs)) a.runs = [];
+    if (a.runs.length > AUTOMATION_RUNS_KEPT) a.runs.length = AUTOMATION_RUNS_KEPT;
+  });
+}
+
+function _automationsJson() {
+  return JSON.stringify({ v: 1, saved: Date.now(), automations: _automations });
+}
+
+function saveAutomations() {
+  // Keep the archive bounded no matter which path wrote it.
+  _automations.forEach((a) => {
+    if (Array.isArray(a.runs) && a.runs.length > AUTOMATION_RUNS_KEPT) a.runs.length = AUTOMATION_RUNS_KEPT;
+  });
+  try {
+    localStorage.setItem(AUTOMATIONS_KEY, _automationsJson());
+    return true;
+  } catch (e) {
+    // Browser storage is full — drop the oldest archived run(s) until it fits,
+    // so saving the automation itself never fails because of a fat archive.
+    for (let guard = 0; guard < 500; guard++) {
+      let victim = null;
+      _automations.forEach((a) => {
+        const r = a.runs[a.runs.length - 1];
+        if (r && (!victim || (r.at || 0) < (victim.run.at || 0))) victim = { a, run: r };
+      });
+      if (!victim) break;
+      victim.a.runs.pop();
+      try { localStorage.setItem(AUTOMATIONS_KEY, _automationsJson()); return true; } catch (e2) {}
+    }
+    autoStatus("Browser storage is full — export and delete some archived runs.");
+    return false;
+  }
+}
+
+/* ---------- schedule maths ---------- */
+function automationIntervalMs(a) {
+  return Math.max(1, Math.round(a.intervalMinutes || 60)) * 60000;
+}
+
+function _parseHHMM(v) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(v == null ? "" : v).trim());
+  if (!m) return null;
+  const h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+  if (h > 23 || mi > 59) return null;
+  return h * 60 + mi;
+}
+
+/** The “only run between” window as { fromMin, toMin } minutes-of-day, or null. */
+function _autoWindow(a) {
+  const from = _parseHHMM(a.activeFrom), to = _parseHHMM(a.activeTo);
+  if (from == null || to == null) return null;
+  return { fromMin: from, toMin: to };
+}
+
+function _withinWindow(w, d) {
+  if (!w) return true;
+  const m = d.getHours() * 60 + d.getMinutes();
+  // “from” may be later than “to”, which means the window wraps midnight.
+  return w.fromMin <= w.toMin ? (m >= w.fromMin && m < w.toMin) : (m >= w.fromMin || m < w.toMin);
+}
+
+function _nextWindowStart(w, ts) {
+  if (!w) return ts;
+  const d = new Date(ts);
+  if (_withinWindow(w, d)) return ts;
+  const cand = new Date(ts);
+  cand.setHours(Math.floor(w.fromMin / 60), w.fromMin % 60, 0, 0);
+  if (cand.getTime() <= ts) cand.setDate(cand.getDate() + 1);
+  return cand.getTime();
+}
+
+/** When this automation next runs: last completion + interval, clamped into the
+ *  active window. A slot missed while the tab was closed is due *now* (once). */
+function automationNextRunAt(a) {
+  const base = a.lastRunAt || a.createdAt || Date.now();
+  let t = base + automationIntervalMs(a);
+  const now = Date.now();
+  if (t < now) t = now;
+  return _nextWindowStart(_autoWindow(a), t);
+}
+
+function relMs(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 1) return "<1 min";
+  if (m < 60) return m + " min";
+  const h = Math.floor(m / 60), r = m % 60;
+  if (h < 24) return h + "h" + (r ? " " + r + "m" : "");
+  return Math.round(h / 24) + "d";
+}
+
+function nextRunText(a) {
+  const t = automationNextRunAt(a);
+  const abs = new Date(t).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  return t - Date.now() <= 5000 ? `due now (${abs})` : `${abs} (in ${relMs(t - Date.now())})`;
+}
+
+/* ---------- criteria snapshot ---------- */
+function windowDaysOf(p) {
+  const a = parseISODate(p && p.date_from), b = parseISODate(p && p.date_to);
+  if (!a || !b) return 30;
+  return Math.max(2, Math.min(31, Math.round((b - a) / MS_DAY) + 1));
+}
+
+function autoCriteriaText(p, fast) {
+  p = p || {};
+  const ticket = ({ both: "round-trip vs. two one-ways", roundtrip: "round-trip only", oneway: "two one-ways only" })[p.ticket_type] || "round-trip";
+  const bits = [
+    `<strong>${_esc(p.origin || "?")}</strong> → <strong>${_esc(p.destination || "?")}</strong>`,
+    `${_esc(p.date_from || "—")} … ${_esc(p.date_to || "—")}`,
+    `${p.min_days}–${p.max_days} day stay`,
+    _esc(ticket),
+    _esc(p.currency || ""),
+  ];
+  if (p.direct_only) bits.push("direct only");
+  if (p.open_jaw) bits.push("open-jaw allowed");
+  bits.push(fast ? "fast (sampled days)" : (p.date_mode === "every" ? "exhaustive dates" : "sampled dates"));
+  return `<strong>Criteria:</strong> ${bits.filter(Boolean).join(" · ")}`;
+}
+
+/** The params a run actually uses: the captured criteria, with the per-automation
+ *  fast-mode and sliding-window overrides applied. */
+function automationRunParams(a) {
+  const p = Object.assign({}, a.params || {});
+  if (a.fast) p.date_mode = "sampled";
+  if (a.reanchor) {
+    const lead = Math.max(0, parseInt(a.leadDays, 10) || 0);
+    const span = Math.max(1, (a.windowDays || windowDaysOf(p))) - 1;
+    const from = addDays(new Date(), lead);
+    p.date_from = isoLocal(from);
+    p.date_to = isoLocal(addDays(from, span));
+  }
+  return p;
+}
+
+/* ---------- run summary + archive ---------- */
+function _summaryPick(f, currency) {
+  if (!f) return null;
+  return {
+    price: f.price,
+    currency,
+    route: `${f.origin_airport}→${f.dest_airport}`,
+    when: f.return_date ? `${fmtDate(f.outbound_date)}–${fmtDate(f.return_date)}` : fmtDate(f.outbound_date),
+    airline: (f.airlines || []).join(", "),
+    stops: f.stops,
+    ticket: _ticketLabel(f),
+  };
+}
+
+function summarizeRun(data) {
+  if (!data) return null;
+  const rt = data.cheapest_roundtrip || data.cheapest_roundtrip_direct || null;
+  const ow = data.cheapest_oneway || data.cheapest_oneway_direct || null;
+  const ranked = data.ranked_options || [];
+  return {
+    currency: data.currency,
+    count: data.all_results_count || 0,
+    roundtrip: _summaryPick(rt, data.currency),
+    oneway: _summaryPick(ow, data.currency),
+    best: _summaryPick(ranked[0], data.currency) || _summaryPick(rt, data.currency) ||
+      _summaryPick(ow, data.currency),
+    lookups: data.searches_performed || 0,
+    pairs: `${data.pairs_searched || 0}/${data.pairs_available || 0}`,
+  };
+}
+
+/** A deep copy of the results, kept whole so a past run can be re-displayed. */
+function archiveData(data) {
+  if (!data) return null;
+  try { return JSON.parse(JSON.stringify(data)); } catch (e) { return null; }
+}
+
+/* ---------- notifications ---------- */
+function notifyAutomationRun(a, run) {
+  // The favicon and title are set by runAutomation(); this only raises the OS
+  // notification (one per automation, so they replace rather than stack).
+  if (!notifySupported() || a.notify === false) return;
+  try {
+    if (Notification.permission !== "granted") return;
+    const s = run.summary;
+    let body;
+    if (!run.ok) {
+      body = `Run failed: ${run.error || "unknown error"}`;
+    } else {
+      const best = s && s.best;
+      body = best && best.price != null
+        ? `Cheapest ${best.price} ${s.currency || ""} · ${best.route} · ${best.when}`
+        : "No flights found in this run";
+      if (best && best.ticket) body += `\n${best.ticket}`;
+      body += `\nRun ${a.runs.length} archived${run.stopped ? " (stopped early)" : ""} · ${s && s.lookups ? s.lookups + " lookups" : ""}`;
+    }
+    const n = new Notification(`FlightsChart automation — ${a.name}`, {
+      body, icon: _staticIconHref || undefined, tag: "flightschart-auto-" + a.id, renotify: true,
+    });
+    n.onclick = () => { try { window.focus(); n.close(); } catch (e) {} };
+  } catch (e) { /* blocked — the title/favicon still announce it */ }
+}
+
+/* ---------- the run itself ---------- */
+async function runAutomation(a, manual) {
+  if (!a || _searchInFlight) return false;
+  _searchInFlight = true;
+  _automationRunningId = a.id;
+  a.running = true;
+  renderAutomations();
+  autoStatus(`Running “${a.name}”…`);
+
+  const startedAt = Date.now();
+  const params = automationRunParams(a);
+  window._currency = params.currency || window._currency;
+  window._stopRequested = false;
+
+  requestNotifyPermission();
+  startKeepAlive();
+  setFaviconMode("searching");
+  setTabTitle(`⏳ ${a.name} — automation searching`);
+  try { if (document.body && document.body.classList) document.body.classList.add("searching"); } catch (e) {}
+
+  const onLine = (p) => {
+    p = p || {};
+    if (p.total) setTabTitle(`⏳ ${a.name}: ${p.done || 0}/${p.total}`);
+    const el = $("progress");
+    if (el) {
+      el.style.display = "block";
+      el.textContent = `Automation “${a.name}”: ${p.done || 0}/${p.total || 0} lookups · ${p.found || 0} found`;
+    }
+    autoStatus(`“${a.name}”: ${p.done || 0}/${p.total || 0} lookups…`);
+  };
+
+  let data = null, error = null;
+  try {
+    data = await runSearch(params, onLine, {});
+  } catch (e) {
+    error = e;
+  }
+
+  const stopped = !!window._stopRequested;
+  window._stopRequested = false;
+  const run = {
+    id: newId(),
+    at: startedAt,
+    tookMs: Date.now() - startedAt,
+    ok: !error,
+    error: error ? (error.message || String(error)) : null,
+    stopped,
+    params,
+    summary: summarizeRun(data),
+    data: archiveData(data),
+  };
+  a.runs.unshift(run);
+  if (a.runs.length > AUTOMATION_RUNS_KEPT) a.runs.length = AUTOMATION_RUNS_KEPT;
+  a.running = false;
+  a.lastStatus = error ? "error" : "ok";
+  a.lastRunAt = Date.now();   // the interval runs from completion, not start
+  _automationRunningId = null;
+  _searchInFlight = false;
+  stopKeepAlive();
+  try { if (document.body && document.body.classList) document.body.classList.remove("searching"); } catch (e) {}
+  if ($("progress")) $("progress").style.display = "none";
+  setFaviconMode(error ? "idle" : "done");
+  _titleDone = true;
+  setTabTitle(error ? BASE_TITLE : `✅ ${a.name} — done`);
+
+  saveAutomations();
+  renderAutomations();
+
+  if (data) {
+    renderResults(Object.assign({}, data, {
+      note: `Automation “${a.name}” — run ${new Date(startedAt).toLocaleString()}. ${data.note || ""}`,
+    }));
+    $("results").style.display = "block";
+  }
+  notifyAutomationRun(a, run);
+  autoStatus(error
+    ? `“${a.name}” failed: ${run.error}`
+    : `“${a.name}” finished — archived (${a.runs.length} run${a.runs.length === 1 ? "" : "s"} saved).`);
+  return true;
+}
+
+/* ---------- actions ---------- */
+function runAutomationById(id, manual) {
+  const a = _automations.find((x) => x.id === id);
+  if (!a) return Promise.resolve(false);
+  if (_searchInFlight) { autoStatus("A search is already running — try again when it finishes."); return Promise.resolve(false); }
+  const p = runAutomation(a, manual)
+    .catch(() => {})
+    .then(() => { if (_automationRunPromise === p) _automationRunPromise = null; });
+  _automationRunPromise = p;
+  return p;
+}
+
+function toggleAutomation(id) {
+  const a = _automations.find((x) => x.id === id);
+  if (!a) return;
+  a.enabled = a.enabled === false;
+  saveAutomations();
+  renderAutomations();
+  autoStatus(a.enabled ? `“${a.name}” enabled — ${nextRunText(a)}.` : `“${a.name}” paused.`);
+}
+
+function deleteAutomation(id) {
+  const a = _automations.find((x) => x.id === id);
+  if (!a) return;
+  if (typeof confirm === "function" && !confirm(`Delete “${a.name}” and its ${(a.runs || []).length} archived run(s)?`)) return;
+  _automations = _automations.filter((x) => x.id !== id);
+  if (_editingAutomationId === id) { _editingAutomationId = null; _autoDraftParams = null; resetAutoForm(); renderAutoCriteria(); }
+  saveAutomations();
+  renderAutomations();
+  autoStatus(`Deleted “${a.name}”.`);
+}
+
+function editAutomation(id) {
+  const a = _automations.find((x) => x.id === id);
+  if (!a) return;
+  _editingAutomationId = id;
+  _autoDraftParams = JSON.parse(JSON.stringify(a.params || {}));
+  if ($("autoName")) $("autoName").value = a.name || "";
+  const mins = a.intervalMinutes || 60;
+  let num = mins, unit = "1";
+  if (mins % 1440 === 0) { num = mins / 1440; unit = "1440"; }
+  else if (mins % 60 === 0) { num = mins / 60; unit = "60"; }
+  else if (mins === 30 || mins === 15) { num = 1; unit = String(mins); }
+  if ($("autoInterval")) $("autoInterval").value = String(num);
+  if ($("autoIntervalUnit")) $("autoIntervalUnit").value = unit;
+  if ($("autoActiveFrom")) $("autoActiveFrom").value = a.activeFrom || "";
+  if ($("autoActiveTo")) $("autoActiveTo").value = a.activeTo || "";
+  if ($("autoLeadDays")) $("autoLeadDays").value = String(a.leadDays != null ? a.leadDays : 30);
+  if ($("autoFast")) $("autoFast").checked = a.fast !== false;
+  if ($("autoReanchor")) $("autoReanchor").checked = !!a.reanchor;
+  if ($("autoNotify")) $("autoNotify").checked = a.notify !== false;
+  if ($("autoCancel")) $("autoCancel").style.display = "inline-flex";
+  renderAutoCriteria();
+  autoStatus(`Editing “${a.name}” — save to apply.`);
+  try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
+  try { if ($("autoName") && $("autoName").scrollIntoView) $("autoName").scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
+}
+
+function viewArchivedRun(aid, rid) {
+  const a = _automations.find((x) => x.id === aid);
+  const run = a && a.runs.find((r) => r.id === rid);
+  if (!run || !run.data) { autoStatus("That archived run has no stored results."); return; }
+  renderResults(Object.assign({}, run.data, {
+    note: `Archived automation run — “${a.name}”, ${new Date(run.at).toLocaleString()}. ${run.data.note || ""}`,
+  }));
+  $("results").style.display = "block";
+  autoStatus(`Showing the archived run from ${new Date(run.at).toLocaleString()}.`);
+  try { if ($("results") && $("results").scrollIntoView) $("results").scrollIntoView({ behavior: "smooth", block: "start" }); } catch (e) {}
+}
+
+async function runAllEnabled() {
+  const targets = _automations.filter((a) => a.enabled !== false);
+  if (!targets.length) { autoStatus("No enabled automations."); return; }
+  if (targets.length > 1 && typeof confirm === "function" &&
+      !confirm(`Run all ${targets.length} enabled automations now? They run one after another and can take a while.`)) return;
+  for (const a of targets) {
+    if (_searchInFlight) { autoStatus("Stopped — a search is already running."); return; }
+    await runAutomationById(a.id, true);
+  }
+}
+
+/* ---------- export / import ---------- */
+function downloadJson(filename, obj) {
+  try {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    return true;
+  } catch (e) {
+    autoStatus("Export failed: " + (e.message || e));
+    return false;
+  }
+}
+
+function exportAutomations() {
+  if (!_automations.length) { autoStatus("Nothing to export yet."); return; }
+  if (downloadJson(`flightschart-automations-${isoLocal(new Date())}.json`,
+    { v: 1, exported: new Date().toISOString(), automations: _automations })) {
+    autoStatus(`Exported ${_automations.length} automation(s) with their archives.`);
+  }
+}
+
+function exportAutomation(id) {
+  const a = _automations.find((x) => x.id === id);
+  if (!a) return;
+  const safe = String(a.name || "automation").replace(/[^\w.-]+/g, "_").slice(0, 40);
+  if (downloadJson(`flightschart-${safe}-${isoLocal(new Date())}.json`,
+    { v: 1, exported: new Date().toISOString(), automations: [a] })) {
+    autoStatus(`Exported “${a.name}” and its ${a.runs.length} archived run(s).`);
+  }
+}
+
+function importAutomations(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = JSON.parse(String(reader.result));
+      const incoming = Array.isArray(parsed) ? parsed : (parsed && parsed.automations);
+      if (!Array.isArray(incoming)) throw new Error("no automations array found");
+      let n = 0;
+      incoming.forEach((a) => {
+        if (!a || typeof a !== "object") return;
+        const copy = JSON.parse(JSON.stringify(a));
+        copy.id = copy.id || newId();
+        if (_automations.some((x) => x.id === copy.id)) copy.id = newId();
+        if (!Array.isArray(copy.runs)) copy.runs = [];
+        if (copy.runs.length > AUTOMATION_RUNS_KEPT) copy.runs.length = AUTOMATION_RUNS_KEPT;
+        if (!copy.params || typeof copy.params !== "object") copy.params = {};
+        _automations.push(copy);
+        n++;
+      });
+      saveAutomations();
+      renderAutomations();
+      autoStatus(`Imported ${n} automation(s).`);
+    } catch (e) {
+      autoStatus("Import failed: " + (e.message || e));
+    }
+  };
+  reader.onerror = () => autoStatus("Could not read that file.");
+  reader.readAsText(file);
+}
+
+/* ---------- form ---------- */
+function renderAutoCriteria() {
+  const el = $("autoCriteria");
+  if (!el) return;
+  if (!_autoDraftParams) {
+    el.textContent = "No criteria captured yet — set the search form above, then press “Use current form criteria” (pressing Save also captures the form as it is right now).";
+    return;
+  }
+  const fast = $("autoFast") ? $("autoFast").checked : true;
+  el.innerHTML = autoCriteriaText(_autoDraftParams, fast);
+}
+
+function resetAutoForm() {
+  const set = (id, v) => { const el = $(id); if (el) el.value = v; };
+  set("autoName", "");
+  set("autoInterval", "1");
+  set("autoIntervalUnit", "60");
+  set("autoActiveFrom", "");
+  set("autoActiveTo", "");
+  set("autoLeadDays", "30");
+  const chk = (id, v) => { const el = $(id); if (el) el.checked = v; };
+  chk("autoFast", true);
+  chk("autoReanchor", false);
+  chk("autoNotify", true);
+  if ($("autoCancel")) $("autoCancel").style.display = "none";
+}
+
+function saveAutoFromForm() {
+  const name = ($("autoName") && $("autoName").value || "").trim() || "Automation";
+  const unit = parseInt($("autoIntervalUnit") && $("autoIntervalUnit").value, 10) || 60;
+  const num = Math.max(1, parseInt($("autoInterval") && $("autoInterval").value, 10) || 1);
+  const from = ($("autoActiveFrom") && $("autoActiveFrom").value || "").trim();
+  const to = ($("autoActiveTo") && $("autoActiveTo").value || "").trim();
+  if ((from && !to) || (!from && to)) {
+    autoStatus("Set both the “from” and “to” times, or leave both blank for “any time”.");
+    return;
+  }
+  const params = _autoDraftParams || readFormParams();
+  if (!params.origin || !params.destination) {
+    autoStatus("Fill in From and To (or capture the form criteria) before saving.");
+    return;
+  }
+  const existing = _editingAutomationId ? _automations.find((x) => x.id === _editingAutomationId) : null;
+  const a = existing || { id: newId(), createdAt: Date.now(), runs: [], lastRunAt: null };
+  Object.assign(a, {
+    name,
+    intervalMinutes: num * unit,
+    params: JSON.parse(JSON.stringify(params)),
+    windowDays: windowDaysOf(params),
+    fast: !$("autoFast") || !!$("autoFast").checked,
+    reanchor: !!( $("autoReanchor") && $("autoReanchor").checked),
+    leadDays: Math.max(0, parseInt($("autoLeadDays") && $("autoLeadDays").value, 10) || 0),
+    activeFrom: from,
+    activeTo: to,
+    notify: !$("autoNotify") || !!$("autoNotify").checked,
+    enabled: existing ? existing.enabled !== false : true,
+  });
+  if (!existing) _automations.push(a);
+  saveAutomations();
+  // Saving is a user gesture, i.e. a valid moment to ask for notification
+  // permission, so an unattended run can actually reach the OS.
+  if (a.notify !== false) { try { requestNotifyPermission(); } catch (e) {} }
+  _editingAutomationId = null;
+  _autoDraftParams = null;
+  resetAutoForm();
+  renderAutoCriteria();
+  renderAutomations();
+  autoStatus(`Saved “${a.name}” — every ${relMs(automationIntervalMs(a))}, ${nextRunText(a)}.`);
+}
+
+function onAutomationListClick(e) {
+  const t = e.target && e.target.closest ? e.target.closest("button") : null;
+  if (!t) return;
+  const attr = (n) => t.getAttribute("data-auto-" + n);
+  if (attr("toggle")) return toggleAutomation(attr("toggle"));
+  if (attr("run")) return runAutomationById(attr("run"), true);
+  if (attr("edit")) return editAutomation(attr("edit"));
+  if (attr("del")) return deleteAutomation(attr("del"));
+  if (attr("export")) return exportAutomation(attr("export"));
+  const view = attr("view");
+  if (view) {
+    const parts = view.split("|");
+    return viewArchivedRun(parts[0], parts[1]);
+  }
+}
+
+/* ---------- rendering ---------- */
+function updateAutomationBadge() {
+  const el = $("automationBadge");
+  if (!el) return;
+  if (_automationRunningId) {
+    const a = _automations.find((x) => x.id === _automationRunningId);
+    el.textContent = a ? "running: " + a.name : "running";
+    el.className = "auto-badge running";
+    return;
+  }
+  const enabled = _automations.filter((a) => a.enabled !== false).length;
+  el.textContent = _automations.length ? `${enabled}/${_automations.length} active` : "none";
+  el.className = "auto-badge" + (enabled ? " on" : "");
+}
+
+function refreshAutomationTimers() {
+  updateAutomationBadge();
+  _automations.forEach((a) => {
+    const el = document.querySelector(`[data-auto-next="${a.id}"]`);
+    if (el) el.textContent = a.running ? "running now" : (a.enabled === false ? "paused" : nextRunText(a));
+  });
+}
+
+function runRowHtml(a, run) {
+  const s = run.summary || {};
+  let best;
+  if (!run.ok) best = `<span style="color:var(--danger)">failed: ${_esc(run.error || "error")}</span>`;
+  else if (s.best && s.best.price != null) {
+    best = `<strong>${s.best.price} ${_esc(s.currency || "")}</strong> · ${_esc(s.best.route)} · ${_esc(s.best.when)} · ${_esc(s.best.ticket || "")}`;
+  } else best = "no flights found";
+  const view = run.data
+    ? `<button type="button" class="btn-mini ghost" data-auto-view="${a.id}|${run.id}">View results</button>` : "";
+  return `<div class="auto-run">
+    <span class="auto-run-when">${_esc(new Date(run.at).toLocaleString())}${run.tookMs ? ` · ${_esc(relMs(run.tookMs))}` : ""}</span>
+    <span class="auto-run-best">${best}</span>
+    ${run.stopped ? '<span class="auto-tag">stopped early</span>' : ""}
+    ${view}
+  </div>`;
+}
+
+function automationCardHtml(a) {
+  const enabled = a.enabled !== false;
+  const runs = a.runs || [];
+  const last = runs[0];
+  const lastTxt = !last ? "no runs yet" : `${new Date(last.at).toLocaleString()} — ${last.ok ? (last.stopped ? "stopped early" : "ok") : "failed"}`;
+  const win = (a.activeFrom && a.activeTo) ? ` · only ${_esc(a.activeFrom)}–${_esc(a.activeTo)}` : "";
+  const history = runs.length
+    ? `<details class="auto-history"><summary>Archive — ${runs.length} run${runs.length === 1 ? "" : "s"} (last ${AUTOMATION_RUNS_KEPT} kept)</summary>${runs.map((r) => runRowHtml(a, r)).join("")}</details>`
+    : `<p class="auto-empty">No runs archived yet.</p>`;
+  return `<div class="auto-item ${enabled ? "" : "off"}">
+    <div class="auto-item-top">
+      <span class="auto-name">${_esc(a.name)}</span>
+      <span class="auto-meta">every ${_esc(relMs(automationIntervalMs(a)))}${win} · <span data-auto-next="${a.id}">${_esc(enabled ? nextRunText(a) : "paused")}</span> · last: ${_esc(lastTxt)}</span>
+      <span class="auto-actions">
+        <button type="button" class="btn-mini ghost" data-auto-toggle="${a.id}">${enabled ? "Pause" : "Resume"}</button>
+        <button type="button" class="btn-mini ghost" data-auto-run="${a.id}">Run now</button>
+        <button type="button" class="btn-mini ghost" data-auto-edit="${a.id}">Edit</button>
+        <button type="button" class="btn-mini ghost" data-auto-export="${a.id}">Export</button>
+        <button type="button" class="btn-mini ghost" data-auto-del="${a.id}">Delete</button>
+      </span>
+    </div>
+    <div class="auto-meta">${autoCriteriaText(a.params, a.fast)}</div>
+    ${history}
+  </div>`;
+}
+
+function renderAutomations() {
+  const list = $("automationList");
+  if (!list) return;
+  updateAutomationBadge();
+  if (!_automations.length) {
+    list.innerHTML = `<p class="hint">No automations yet. Set your search criteria above, choose an interval, then press “Use current form criteria” → “Save automation”.</p>`;
+    return;
+  }
+  list.innerHTML = _automations.map(automationCardHtml).join("");
+}
+
+/* ---------- scheduler ---------- */
+function automationTick() {
+  refreshAutomationTimers();
+  if (!_automations.length || _searchInFlight) return;
+  // Resolving airport names needs the airport data, so wait until it is loaded.
+  if (!Object.keys(AIRPORTS).length) return;
+  const now = Date.now();
+  const due = _automations.find((a) => a.enabled !== false && automationNextRunAt(a) <= now);
+  if (due) runAutomationById(due.id, false);
+}
+
+function initAutomations() {
+  if (!$("automationList")) return;
+  loadAutomations();
+  resetAutoForm();
+  renderAutoCriteria();
+  renderAutomations();
+
+  $("automationList").addEventListener("click", onAutomationListClick);
+  if ($("autoCapture")) $("autoCapture").addEventListener("click", () => {
+    _autoDraftParams = readFormParams();
+    renderAutoCriteria();
+    autoStatus("Criteria captured from the form above.");
+  });
+  if ($("autoSave")) $("autoSave").addEventListener("click", saveAutoFromForm);
+  if ($("autoCancel")) $("autoCancel").addEventListener("click", () => {
+    _editingAutomationId = null;
+    _autoDraftParams = null;
+    resetAutoForm();
+    renderAutoCriteria();
+    autoStatus("Edit cancelled.");
+  });
+  if ($("autoFast") && $("autoFast").addEventListener) $("autoFast").addEventListener("change", renderAutoCriteria);
+  if ($("autoRunAll")) $("autoRunAll").addEventListener("click", () => { runAllEnabled(); });
+  if ($("autoExport")) $("autoExport").addEventListener("click", exportAutomations);
+  if ($("autoImport")) $("autoImport").addEventListener("click", () => { if ($("autoImportFile")) $("autoImportFile").click(); });
+  if ($("autoImportFile")) $("autoImportFile").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) importAutomations(f);
+    e.target.value = "";
+  });
+
+  if (_automationTickTimer) clearInterval(_automationTickTimer);
+  _automationTickTimer = setInterval(automationTick, AUTOMATION_TICK_MS);
+  refreshAutomationTimers();
+}
+
 /* ------------------------------------------------------------------ *
  *  Form input rules
  *  - The city/country fields are CAPITALS-ONLY: whatever is typed (or
@@ -2508,6 +3213,14 @@ function wire() {
   // One place that runs a search from the form, so the resume banner can reuse it.
   async function doSearch(opts) {
     syncDateBounds(false);   // never search with a window that contradicts itself
+    // An automation run uses the same engine and the same reader quota, so let
+    // it stop and finish before a manual search takes over.
+    if (_automationRunPromise) {
+      autoStatus("Finishing the running automation first…");
+      window._stopRequested = true;
+      try { await _automationRunPromise; } catch (e) {}
+    }
+    _searchInFlight = true;
     $("errorBox").style.display = "none";
     $("results").style.display = "none";
     $("resumeBox").style.display = "none";
@@ -2531,20 +3244,7 @@ function wire() {
     try { if (document.body && document.body.classList) document.body.classList.add("searching"); } catch (e) {}
     Promise.resolve(requestNotifyPermission()).then(syncNotifyStatus, () => {});
 
-    const params = {
-      origin: $("origin").value.trim().toUpperCase(),
-      destination: $("destination").value.trim().toUpperCase(),
-      min_days: parseInt($("min_days").value, 10) || 6,
-      max_days: parseInt($("max_days").value, 10) || 7,
-      date_from: $("date_from").value || null,
-      date_to: $("date_to").value || null,
-      date_mode: $("date_mode") ? $("date_mode").value : "sampled",
-      window_mode: $("window_mode") ? $("window_mode").value : "trip",
-      currency: $("currency").value,
-      open_jaw: $("open_jaw").value === "true",
-      ticket_type: $("ticket_type") ? $("ticket_type").value : "roundtrip",
-      direct_only: $("direct_only") ? $("direct_only").checked : false,
-    };
+    const params = readFormParams();
     window._currency = params.currency;
     saveSettings();
 
@@ -2583,6 +3283,7 @@ function wire() {
       setFaviconMode("idle");
       setTabTitle(BASE_TITLE);
     } finally {
+      _searchInFlight = false;
       stopKeepAlive();
       resetStopConfirm();
       try { if (document.body && document.body.classList) document.body.classList.remove("searching"); } catch (e) {}
@@ -2645,7 +3346,10 @@ function wire() {
       _titleDone = false;
       setTabTitle(BASE_TITLE);
     }
+    refreshAutomationTimers();
   });
+
+  initAutomations();
 
   (async () => {
     try { await loadAirports(); } catch (e) {}

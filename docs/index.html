@@ -46,7 +46,7 @@
         </svg>
         <span>Cheap Flights Finder</span>
       </h1>
-      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Round-trip <em>or</em> two separate one-ways (compared) · Open-jaw supported · Direct-only filter · Outbound <em>and</em> return details · Cross-check the cheapest options on Google Flights (Gotogate is listed there), Kiwi.com &amp; Skyscanner · Runs in the background and notifies you when it's done</p>
+      <p>Live Google Flights prices · Country → all commercial airports · City → primary airport · Flexible dates &amp; stay length · Round-trip <em>or</em> two separate one-ways (compared) · Open-jaw supported · Direct-only filter · Outbound <em>and</em> return details · Cross-check the cheapest options on Google Flights (Gotogate is listed there), Kiwi.com &amp; Skyscanner · Runs in the background and notifies you when it's done · Automations re-run a search on your schedule and archive every run</p>
       <div class="status-row">
         <span class="pill" id="dataPill"><span class="dot"></span><span id="dataPillText">data: live Google Flights</span></span>
         <span class="pill" id="airportPill"><span class="dot"></span><span id="airportPillText">airports: loading…</span></span>
@@ -218,6 +218,91 @@
             airport sets quickly. Setting the ceiling above 0 caps the sweep (departure dates are spread across
             the window and the result header states exactly what was covered); <strong>0 means exhaustive</strong>.
           </p>
+        </div>
+      </details>
+    </div>
+
+    <div class="card">
+      <details class="settings" id="automationsCard">
+        <summary>Automations <span class="auto-badge" id="automationBadge">none</span></summary>
+        <div class="settings-body">
+          <p class="hint">
+            <strong>Automations re-run a search on a schedule and keep an archive.</strong> Each automation
+            reuses the selection criteria you capture from the form above, runs every interval you set, sends
+            a browser notification as soon as that run's results list is ready, and saves the run's full
+            results list so you keep an archive of every execution. The last <strong>24 runs</strong> per
+            automation are kept (exportable as JSON). Automations are <strong>paused whenever this page is
+            closed</strong> — a slot missed while away is not replayed many times, the automation simply runs
+            once as soon as you open the app again.
+          </p>
+
+          <div class="form-grid">
+            <div class="full">
+              <label for="autoName">Name</label>
+              <input id="autoName" placeholder="e.g. DUS → Athens, hourly price watch" />
+            </div>
+            <div>
+              <label for="autoInterval">Run every</label>
+              <div class="auto-inline">
+                <input id="autoInterval" type="number" min="1" max="10080" value="1" />
+                <select id="autoIntervalUnit">
+                  <option value="60">hour(s)</option>
+                  <option value="30">30 minutes</option>
+                  <option value="15">15 minutes</option>
+                  <option value="1">minute(s)</option>
+                  <option value="1440">day(s)</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label for="autoActiveFrom">Only run between (optional)</label>
+              <div class="auto-inline">
+                <input id="autoActiveFrom" type="time" />
+                <span class="auto-sep">–</span>
+                <input id="autoActiveTo" type="time" />
+              </div>
+            </div>
+            <div class="full">
+              <label class="inline-check" for="autoFast">
+                <input type="checkbox" id="autoFast" checked />
+                <span>Fast mode — sampled days instead of an exhaustive sweep (recommended for frequent runs)</span>
+              </label>
+            </div>
+            <div class="full">
+              <label class="inline-check" for="autoReanchor">
+                <input type="checkbox" id="autoReanchor" />
+                <span>Slide the date window forward on every run (same length, re-anchored to today)</span>
+              </label>
+            </div>
+            <div>
+              <label for="autoLeadDays">Sliding window starts in (days from today)</label>
+              <input id="autoLeadDays" type="number" min="0" max="365" value="30" />
+            </div>
+            <div>
+              <label class="inline-check" for="autoNotify">
+                <input type="checkbox" id="autoNotify" checked />
+                <span>Notify me when each run's results are ready</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="auto-criteria" id="autoCriteria"></div>
+
+          <div class="settings-inline">
+            <button type="button" class="btn-mini ghost" id="autoCapture">Use current form criteria</button>
+            <button type="button" class="btn-mini" id="autoSave">Save automation</button>
+            <button type="button" class="btn-mini ghost" id="autoCancel" style="display:none">Cancel edit</button>
+          </div>
+
+          <div id="automationList" class="auto-list"></div>
+
+          <div class="settings-inline">
+            <button type="button" class="btn-mini ghost" id="autoRunAll">Run all enabled now</button>
+            <button type="button" class="btn-mini ghost" id="autoExport">Export all (JSON)</button>
+            <button type="button" class="btn-mini ghost" id="autoImport">Import JSON</button>
+            <input type="file" id="autoImportFile" accept="application/json,.json" style="display:none" />
+            <span class="hint" id="autoStatus"></span>
+          </div>
         </div>
       </details>
     </div>
