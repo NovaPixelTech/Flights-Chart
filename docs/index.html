@@ -227,13 +227,19 @@
         <summary>Automations <span class="auto-badge" id="automationBadge">none</span></summary>
         <div class="settings-body">
           <p class="hint">
-            <strong>Automations re-run a search on a schedule and keep an archive.</strong> Each automation
-            reuses the selection criteria you capture from the form above, runs every interval you set, sends
-            a browser notification as soon as that run's results list is ready, and saves the run's full
-            results list so you keep an archive of every execution. The last <strong>24 runs</strong> per
-            automation are kept (exportable as JSON). Automations are <strong>paused whenever this page is
-            closed</strong> — a slot missed while away is not replayed many times, the automation simply runs
-            once as soon as you open the app again.
+            <strong>Automations re-run your search on a schedule and keep an archive.</strong> They always use
+            the selection criteria set in the main form above — here you only choose the name, how often it
+            runs, an optional time window, and whether to be notified. Each run sends a browser notification
+            with the cheapest flight found (price and route), keeps its full results list in the archive
+            (last <strong>24 runs</strong> per automation, exportable as JSON), and clicking any archived run
+            opens that run's results on their own screen with a <em>← Back</em> button.
+            <br><br>
+            <strong>Runs continue where they left off.</strong> Automations only run while this page is open —
+            on a phone, lock the screen or switch apps and the run keeps going in the page; if the page is
+            closed or reloaded, the interrupted run picks up from its saved progress as soon as you open the
+            app again (a slot missed entirely is simply run once when you return, never replayed many times).
+            Install the app to the home screen (Share → Add to Home Screen) to get the notifications on
+            iPhone/iPad.
           </p>
 
           <div class="form-grid">
@@ -261,22 +267,6 @@
                 <span class="auto-sep">–</span>
                 <input id="autoActiveTo" type="time" />
               </div>
-            </div>
-            <div class="full">
-              <label class="inline-check" for="autoFast">
-                <input type="checkbox" id="autoFast" checked />
-                <span>Fast mode — sampled days instead of an exhaustive sweep (recommended for frequent runs)</span>
-              </label>
-            </div>
-            <div class="full">
-              <label class="inline-check" for="autoReanchor">
-                <input type="checkbox" id="autoReanchor" />
-                <span>Slide the date window forward on every run (same length, re-anchored to today)</span>
-              </label>
-            </div>
-            <div>
-              <label for="autoLeadDays">Sliding window starts in (days from today)</label>
-              <input id="autoLeadDays" type="number" min="0" max="365" value="30" />
             </div>
             <div>
               <label class="inline-check" for="autoNotify">
@@ -318,6 +308,25 @@
       <div class="result-header" id="resultMeta"></div>
       <div id="flightResults"></div>
       <p class="note" id="resultNote"></p>
+    </div>
+  </div>
+
+  <!-- The archived-run screen: a run's own results page, opened from an
+       automation's archive, with a back button to the main screen. -->
+  <div class="run-screen" id="runScreen" style="display:none" role="dialog" aria-modal="true" aria-labelledby="runScreenTitle">
+    <div class="run-screen-bar">
+      <button type="button" class="btn-mini" id="runScreenBack">← Back to main screen</button>
+      <div class="run-screen-head">
+        <div class="run-screen-title" id="runScreenTitle"></div>
+        <div class="run-screen-sub" id="runScreenSub"></div>
+      </div>
+      <div class="run-screen-price" id="runScreenPrice"></div>
+    </div>
+    <div class="run-screen-progress" id="runScreenProgress" style="display:none"></div>
+    <div class="run-screen-body">
+      <div class="result-header" id="runScreenMeta"></div>
+      <div id="runScreenResults"></div>
+      <p class="note" id="runScreenNote"></p>
     </div>
   </div>
 

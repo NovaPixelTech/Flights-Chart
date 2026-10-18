@@ -96,13 +96,14 @@ Everything runs in `docs/app.js`. It is a self-contained JavaScript port of the
   [Cross-check on other sites](#cross-check-on-other-sites-google-flights-kiwicom-skyscanner-gotogate)).
   These are plain outbound links: nothing is fetched from those sites, no key is used, and the app
   still makes **only** the reader call described above.
-- **Automations** — the **Automations** card turns a search into a schedule: capture the form's
-  criteria, pick an interval (15/30 minutes, hours or days) and an optional daily time window, and
-  the app re-runs that search, sends a **browser notification as each run's results list is ready**,
-  and **archives each run's full results list** (the last 24 per automation, browsable and
+- **Automations** — the **Automations** card turns the current search into a schedule: give it a
+  name, pick an interval (15/30 minutes, hours or days) and an optional daily time window, and the
+  app re-runs **the main form's criteria**, sends a **browser notification headed by the cheapest
+  flight found** as each run's results list is ready, and **archives each run's full results list**
+  (the last 24 per automation, each one openable on its own screen with a *← Back* button, and
   exportable). Because the page is 100% static, runs happen **while the tab/installed app is open**
-  — a slot missed while it was closed is replayed **once**, not N times. See
-  [Automations](#automations).
+  — an interrupted run continues from its saved progress when you reopen, and a slot missed while it
+  was closed is replayed **once**, not N times. See [Automations](#automations).
 
 > **No secret is embedded and nothing is exposed.** The reader request and the (already
 > public) Google Flights page are the only network calls.
@@ -189,39 +190,53 @@ may differ from Google's.
 
 ## Automations
 
-An **automation** is a saved search plus a schedule: it re-runs itself, notifies you when a run
-finishes, and keeps that run's full results list in an archive you can browse or export.
+An **automation** is a saved search plus a schedule: it re-runs itself, tells you when a run
+finishes (browser notification + on screen), and keeps that run's full results list in an archive
+you can browse or export.
 
 Open the **Automations** card below the search form and:
 
 1. Fill the search form with the criteria you want (route, stay, date window, ticket type,
-   direct-only, currency, …).
+   direct-only, currency, …). This is the **only** place criteria are chosen: an automation always
+   uses the main form's criteria exactly as they stand when it is saved.
 2. In the Automations card set a **name**, an **interval** (15/30 minutes, hours, or days) and —
    optionally — an **“only run between”** band, e.g. `08:00`–`22:00` so it never fires at night.
-3. Press **Use current form criteria** (or just *Save*, which captures the form as it stands), then
-   **Save automation**.
+3. Press **Save automation using current main form criteria**.
 
-Options per automation:
+What each automation offers:
 
 | Option | Meaning |
 | --- | --- |
-| **Fast mode** | Runs `sampled` dates instead of an exhaustive sweep — the sane choice for a frequent (e.g. hourly) run, since it costs far fewer reader lookups. |
-| **Slide the date window forward** | Re-anchors the window to today on every run (same length, starting the chosen number of days out), so a long-lived watch never runs out of dates. |
-| **Notify me when each run's results are ready** | One browser notification per completed run, showing the cheapest option found (and whether the run was stopped early). |
-| **Only run between** | Keeps runs inside a daily time band; a due run outside the band waits for the next band start. |
+| **Name** | What the automation is called in the list and in every notification. |
+| **Run every** | How often it re-runs: minutes, hours or days. |
+| **Only run between** (optional) | Keeps runs inside a daily time band; a due run outside the band waits for the next band start. |
+| **Notify me when each run's results are ready** | One browser notification per completed run, headed by the **cheapest flight found — price and route** — with the run number, dates and airline. |
 
 Each automation keeps the **last 24 runs**. Every archived run stores the **full results list**
-plus a summary (cheapest round-trip and two-one-ways, lookups used, coverage), so **View results**
-re-renders exactly what that run found; **Export** downloads an automation and its archive as JSON,
+plus a summary (cheapest round-trip and two-one-ways, lookups used, coverage), so re-opening it
+renders exactly what that run found. The completed list is built to be scanned: each run's row is
+headed by the **cheapest flight that run found** (price, route, dates, airline), the cheapest run of
+the automation carries a **CHEAPEST** tag, and the card shows a *cheapest so far* line. Clicking a
+run opens **its own results screen** — never mixed into the main results — with a
+**← Back to main screen** button that returns you to the search form or the Automations card, ready
+for a single search or a new automation. **Export** downloads an automation and its archive as JSON,
 **Import JSON** merges a file back in, and deleting an automation removes its archive.
+
+**Runs continue where they left off.** Progress is checkpointed while a run sweeps, so locking the
+phone or switching apps leaves the run going and the progress still on screen; if the page is closed
+or reloaded, the interrupted run **picks up from its saved progress** when the app is opened again
+(the lookups that already finished are skipped) and its progress is shown in the Automations badge
+and in the run screen.
 
 **The honest limitation.** This page is 100% static — there is no server to schedule anything — so
 an automation runs **only while the tab (or the installed app) is open**, reusing the same
 keep-alive and notification machinery as a manual search. If the tab was closed past a run time the
 missed slot is **not** replayed N times: the automation is simply due and runs **once** as soon as
-the page is next opened. Automations also share a single reader quota and run **one at a time** — a
-manual search politely stops a running automation first. (A truly always-on schedule would need a
-keyed backend or a CI cron, which this project deliberately avoids.)
+the page is next opened. On iPhone/iPad the page must be installed to the home screen
+(*Share → Add to Home Screen*, iOS 16.4+) for notifications to appear. Automations also share a
+single reader quota and run **one at a time** — a manual search politely stops a running automation
+first. (A truly always-on schedule would need a keyed backend or a CI cron, which this project
+deliberately avoids.)
 
 Archives live in your browser's `localStorage`. If it fills up, the oldest archived runs are pruned
 automatically, so **export first** if you want to keep them.
@@ -337,11 +352,12 @@ python -m http.server 8000 --directory docs
   checkpointed, and the *Resume* offer skips what was already done). Notifications also need the
   page to be added to the home screen on iOS.
 - **Automations run while the page is open.** A scheduled run reuses the keep-alive + notification
-  path above, so it only fires while the tab (or installed app) is open. A slot missed while the
-  page was closed is replayed **once** on the next open, never N times; automations run **one at a
-  time** on the shared reader quota (a manual search stops a running automation first). Each
-  automation's archive (last 24 runs) is stored in `localStorage` — **export it** before clearing
-  site data.
+  path above, so it only fires while the tab (or installed app) is open. A run interrupted by a
+  locked phone or a reload **continues from its saved progress** on the next open; a slot missed
+  entirely while the page was closed is replayed **once** on the next open, never N times.
+  Automations run **one at a time** on the shared reader quota (a manual search stops a running
+  automation first). Each automation's archive (last 24 runs) is stored in `localStorage` —
+  **export it** before clearing site data.
 - Prices are live estimates only — not bookable through this app. Booking-site comparisons
   (Google Flights, Kiwi.com, Skyscanner, Gotogate) are **outbound links only** — see
   [Cross-check on other sites](#cross-check-on-other-sites-google-flights-kiwicom-skyscanner-gotogate);

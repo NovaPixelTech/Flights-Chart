@@ -1200,6 +1200,9 @@ async function runSearch(params, onProgress, opts) {
   // Progress is checkpointed in localStorage, and a resumed run skips the
   // lookups that already finished and restores their results.
   const resume = (opts && opts.resume) || null;
+  // An automation tags its checkpoints so a reload can tell an interrupted
+  // automation run apart from a manual search that the user may want to resume.
+  const autoId = (opts && opts.autoId) || null;
   const alreadyDone = new Set(resume && Array.isArray(resume.done) ? resume.done : []);
   const finishedKeys = new Set(alreadyDone);
   const taskId = (t) => (t.kind === "oj"
@@ -1360,6 +1363,7 @@ async function runSearch(params, onProgress, opts) {
     try {
       window.localStorage.setItem(RESUME_KEY, JSON.stringify({
         saved: Date.now(),
+        autoId,
         params,
         done: Array.from(finishedKeys),
         options: all,
@@ -1960,10 +1964,27 @@ function _compareCard(data, currency) {
     </div>`;
 }
 
-function renderResults(data) {
+/** Where the three parts of a results view live: the main screen, or the
+ *  archived-run screen, which is a separate page and needs its own ids. */
+const MAIN_RESULT_IDS = { meta: "resultMeta", list: "flightResults", note: "resultNote" };
+const RUN_SCREEN_RESULT_IDS = { meta: "runScreenMeta", list: "runScreenResults", note: "runScreenNote" };
+
+/** Look an element up inside an optional root (defaults to the document). */
+function _inRoot(root, id) {
+  if (!root) return $(id);
+  if (typeof root.querySelector === "function") return root.querySelector("#" + id);
+  return null;
+}
+
+/** Draw a results payload. `where` is null for the main screen, or
+ *  { root, ids } to draw into another container (the archived-run screen). */
+function renderResults(data, where) {
+  const root = (where && where.root) || null;
+  const ids = (where && where.ids) || MAIN_RESULT_IDS;
+  const metaEl = _inRoot(root, ids.meta);
   const originList = (data.origins_searched || []).map((a) => a.code).join(", ");
   const destList = (data.destinations_searched || []).map((a) => a.code).join(", ");
-  $("resultMeta").innerHTML = `
+  if (metaEl) metaEl.innerHTML = `
     <span><strong>${data.origin_input}</strong> → <strong>${data.destination_input}</strong></span>
     <span>Airports: ${originList || "—"} → ${destList || "—"}</span>
     <span>Window <strong>${fmtDate(data.date_from)}</strong> – <strong>${fmtDate(data.date_to)}</strong> · Stay <strong>${data.min_days}–${data.max_days}</strong> days${data.window_mode === "depart" ? " · window = departure date" : " · whole trip inside the window"}</span>
@@ -2097,8 +2118,10 @@ function renderResults(data) {
     html += `</tbody></table></div>`;
   }
 
-  $("flightResults").innerHTML = html;
-  $("resultNote").textContent = data.note || "";
+  const listEl = _inRoot(root, ids.list);
+  if (listEl) listEl.innerHTML = html;
+  const noteEl = _inRoot(root, ids.note);
+  if (noteEl) noteEl.textContent = data.note || "";
 }
 
 /* ------------------------------------------------------------------ *
@@ -2412,11 +2435,17 @@ function readFormParams() {
 const AUTOMATIONS_KEY = "flightschart.automations.v1";
 const AUTOMATION_RUNS_KEPT = 24;
 const AUTOMATION_TICK_MS = 20000;
+/* Where a run in flight was, so closing the phone (iOS suspends the tab) or a
+ * reload can still show the progress and continue the run instead of restarting. */
+const AUTORUN_KEY = "flightschart.autorun.v1";
+const AUTORUN_FRESH_MS = 24 * 3600000;
 
 let _automations = [];
 let _automationRunningId = null;   // id of the automation running right now
 let _automationRunPromise = null;  // resolves when that run finishes
 let _automationTickTimer = null;
+let _autoProgress = null;          // live progress of that run, for the UI
+let _autoResumePending = false;    // an interrupted run is about to be continued
 let _searchInFlight = false;       // shared lock: a manual search OR an automation run
 let _editingAutomationId = null;
 let _autoDraftParams = null;       // criteria captured into the form, not yet saved
@@ -2433,6 +2462,36 @@ function _esc(s) {
 function autoStatus(text) {
   const el = $("autoStatus");
   if (el) el.textContent = text || "";
+}
+
+/* ---------- progress of a run in flight (survives a locked phone / reload) ---- */
+function saveAutoProgress(rec) {
+  try { localStorage.setItem(AUTORUN_KEY, JSON.stringify(rec)); } catch (e) { /* storage full or blocked */ }
+}
+
+function readAutoProgress() {
+  try {
+    const raw = window.localStorage && window.localStorage.getItem(AUTORUN_KEY);
+    if (!raw) return null;
+    const rec = JSON.parse(raw);
+    if (!rec || !rec.automationId) return null;
+    return rec;
+  } catch (e) { return null; }
+}
+
+function clearAutoProgress() {
+  try { if (window.localStorage) window.localStorage.removeItem(AUTORUN_KEY); } catch (e) { /* ignore */ }
+}
+
+/** Repaint everything that shows "a run is going on right now". */
+function paintAutoProgress() {
+  updateAutomationBadge();
+  const el = $("runScreenProgress");
+  if (!el) return;
+  if (!_autoProgress) { el.style.display = "none"; el.textContent = ""; return; }
+  const p = _autoProgress;
+  el.style.display = "block";
+  el.textContent = `Automation “${p.name}” running: ${p.done}/${p.total || 0} lookups · ${p.found || 0} options found — this continues where it left off.`;
 }
 
 /* ---------- storage ---------- */
@@ -2545,13 +2604,7 @@ function nextRunText(a) {
 }
 
 /* ---------- criteria snapshot ---------- */
-function windowDaysOf(p) {
-  const a = parseISODate(p && p.date_from), b = parseISODate(p && p.date_to);
-  if (!a || !b) return 30;
-  return Math.max(2, Math.min(31, Math.round((b - a) / MS_DAY) + 1));
-}
-
-function autoCriteriaText(p, fast) {
+function autoCriteriaText(p) {
   p = p || {};
   const ticket = ({ both: "round-trip vs. two one-ways", roundtrip: "round-trip only", oneway: "two one-ways only" })[p.ticket_type] || "round-trip";
   const bits = [
@@ -2563,23 +2616,14 @@ function autoCriteriaText(p, fast) {
   ];
   if (p.direct_only) bits.push("direct only");
   if (p.open_jaw) bits.push("open-jaw allowed");
-  bits.push(fast ? "fast (sampled days)" : (p.date_mode === "every" ? "exhaustive dates" : "sampled dates"));
+  bits.push(p.date_mode === "every" ? "exhaustive dates" : "sampled dates");
   return `<strong>Criteria:</strong> ${bits.filter(Boolean).join(" · ")}`;
 }
 
-/** The params a run actually uses: the captured criteria, with the per-automation
- *  fast-mode and sliding-window overrides applied. */
+/** The params a run actually uses: exactly the criteria captured from the main
+ *  form at save time. */
 function automationRunParams(a) {
-  const p = Object.assign({}, a.params || {});
-  if (a.fast) p.date_mode = "sampled";
-  if (a.reanchor) {
-    const lead = Math.max(0, parseInt(a.leadDays, 10) || 0);
-    const span = Math.max(1, (a.windowDays || windowDaysOf(p))) - 1;
-    const from = addDays(new Date(), lead);
-    p.date_from = isoLocal(from);
-    p.date_to = isoLocal(addDays(from, span));
-  }
-  return p;
+  return Object.assign({}, a.params || {});
 }
 
 /* ---------- run summary + archive ---------- */
@@ -2613,6 +2657,28 @@ function summarizeRun(data) {
   };
 }
 
+/** The run's number in the order the user means: oldest run = #1, newest = the
+ *  current size of the archive. */
+function runNumber(a, run) {
+  const runs = (a && a.runs) || [];
+  const i = runs.indexOf(run);
+  return "#" + (i < 0 ? "?" : runs.length - i);
+}
+
+/** The cheapest flight this automation has ever produced, across its archive. */
+function cheapestRun(a) {
+  let out = null;
+  ((a && a.runs) || []).forEach((r) => {
+    if (!r || !r.ok) return;
+    const b = r.summary && r.summary.best;
+    if (!b || b.price == null) return;
+    if (!out || b.price < out.price) {
+      out = { price: b.price, currency: r.summary.currency || b.currency || "", best: b, run: r };
+    }
+  });
+  return out;
+}
+
 /** A deep copy of the results, kept whole so a past run can be re-displayed. */
 function archiveData(data) {
   if (!data) return null;
@@ -2626,19 +2692,26 @@ function notifyAutomationRun(a, run) {
   if (!notifySupported() || a.notify === false) return;
   try {
     if (Notification.permission !== "granted") return;
-    const s = run.summary;
-    let body;
+    const s = run.summary || {};
+    const best = s.best;
+    const cur = s.currency || (best && best.currency) || "";
+    const label = runNumber(a, run);
+    let title, body;
     if (!run.ok) {
-      body = `Run failed: ${run.error || "unknown error"}`;
+      title = `FlightsChart — “${a.name}” run failed`;
+      body = run.error || "unknown error";
+    } else if (best && best.price != null) {
+      title = `FlightsChart — cheapest ${best.price} ${cur} · ${best.route}`;
+      body = [
+        `The cheapest flight found for automation “${a.name}” is ${best.price} ${cur} — ${best.route}, ${best.when}.`,
+        `${best.airline || ""}${best.ticket ? " · " + best.ticket : ""}${best.stops === 0 ? " · direct" : ""}`.replace(/^ · /, ""),
+        `Run ${label} archived (${a.runs.length} kept) · ${s.lookups || 0} lookups${run.stopped ? " · stopped early" : ""}`,
+      ].filter(Boolean).join("\n");
     } else {
-      const best = s && s.best;
-      body = best && best.price != null
-        ? `Cheapest ${best.price} ${s.currency || ""} · ${best.route} · ${best.when}`
-        : "No flights found in this run";
-      if (best && best.ticket) body += `\n${best.ticket}`;
-      body += `\nRun ${a.runs.length} archived${run.stopped ? " (stopped early)" : ""} · ${s && s.lookups ? s.lookups + " lookups" : ""}`;
+      title = `FlightsChart — “${a.name}” finished`;
+      body = `No flights found in this run.`;
     }
-    const n = new Notification(`FlightsChart automation — ${a.name}`, {
+    const n = new Notification(title, {
       body, icon: _staticIconHref || undefined, tag: "flightschart-auto-" + a.id, renotify: true,
     });
     n.onclick = () => { try { window.focus(); n.close(); } catch (e) {} };
@@ -2646,18 +2719,24 @@ function notifyAutomationRun(a, run) {
 }
 
 /* ---------- the run itself ---------- */
-async function runAutomation(a, manual) {
+async function runAutomation(a, manual, resume) {
   if (!a || _searchInFlight) return false;
   _searchInFlight = true;
   _automationRunningId = a.id;
   a.running = true;
   renderAutomations();
-  autoStatus(`Running “${a.name}”…`);
+  autoStatus(resume
+    ? `Continuing “${a.name}” (${resume.done.length} lookups were already done)…`
+    : `Running “${a.name}”…`);
 
   const startedAt = Date.now();
   const params = automationRunParams(a);
   window._currency = params.currency || window._currency;
   window._stopRequested = false;
+  saveAutoProgress({
+    automationId: a.id, name: a.name, startedAt,
+    done: resume ? resume.done.length : 0, total: 0, found: 0, at: Date.now(),
+  });
 
   requestNotifyPermission();
   startKeepAlive();
@@ -2665,8 +2744,11 @@ async function runAutomation(a, manual) {
   setTabTitle(`⏳ ${a.name} — automation searching`);
   try { if (document.body && document.body.classList) document.body.classList.add("searching"); } catch (e) {}
 
+  let sinceProgressSave = 0;
   const onLine = (p) => {
     p = p || {};
+    _autoProgress = { id: a.id, name: a.name, done: p.done || 0, total: p.total || 0, found: p.found || 0 };
+    paintAutoProgress();
     if (p.total) setTabTitle(`⏳ ${a.name}: ${p.done || 0}/${p.total}`);
     const el = $("progress");
     if (el) {
@@ -2674,11 +2756,20 @@ async function runAutomation(a, manual) {
       el.textContent = `Automation “${a.name}”: ${p.done || 0}/${p.total || 0} lookups · ${p.found || 0} found`;
     }
     autoStatus(`“${a.name}”: ${p.done || 0}/${p.total || 0} lookups…`);
+    // Persisted a little less often than it is painted — this is what lets a
+    // reopened phone pick the run up where it stopped instead of starting over.
+    if (Date.now() - sinceProgressSave > 2000) {
+      sinceProgressSave = Date.now();
+      saveAutoProgress({
+        automationId: a.id, name: a.name, startedAt,
+        done: p.done || 0, total: p.total || 0, found: p.found || 0, at: Date.now(),
+      });
+    }
   };
 
   let data = null, error = null;
   try {
-    data = await runSearch(params, onLine, {});
+    data = await runSearch(params, onLine, { autoId: a.id, resume: resume || null });
   } catch (e) {
     error = e;
   }
@@ -2702,37 +2793,89 @@ async function runAutomation(a, manual) {
   a.lastStatus = error ? "error" : "ok";
   a.lastRunAt = Date.now();   // the interval runs from completion, not start
   _automationRunningId = null;
+  _autoProgress = null;
   _searchInFlight = false;
+  clearAutoProgress();        // the run is over, there is nothing left to continue
   stopKeepAlive();
   try { if (document.body && document.body.classList) document.body.classList.remove("searching"); } catch (e) {}
   if ($("progress")) $("progress").style.display = "none";
   setFaviconMode(error ? "idle" : "done");
   _titleDone = true;
-  setTabTitle(error ? BASE_TITLE : `✅ ${a.name} — done`);
+  const s = run.summary || {};
+  const cheap = s.best && s.best.price != null
+    ? `cheapest ${s.best.price} ${s.currency || s.best.currency || ""} · ${s.best.route}`
+    : "no flights found";
+  setTabTitle(error ? BASE_TITLE : `✅ ${a.name} — ${cheap}`);
 
   saveAutomations();
   renderAutomations();
+  paintAutoProgress();
   try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
 
   if (data) {
-    renderResults(Object.assign({}, data, {
-      note: `Automation “${a.name}” — run ${new Date(startedAt).toLocaleString()}. ${data.note || ""}`,
-    }));
-    $("results").style.display = "block";
+    // The run gets its own screen, so the main screen is left exactly as the
+    // user had it (a single search, or the form for a new automation).
+    showRunScreen(a, run, data);
   }
   notifyAutomationRun(a, run);
   autoStatus(error
     ? `“${a.name}” failed: ${run.error}`
-    : `“${a.name}” finished — archived (${a.runs.length} run${a.runs.length === 1 ? "" : "s"} saved).`);
+    : `“${a.name}” finished — ${cheap}, archived as run ${runNumber(a, run)} (${a.runs.length} run${a.runs.length === 1 ? "" : "s"} kept).`);
   return true;
 }
 
+/* ---------- the archived-run screen (its own page, with a back button) ------ */
+function showRunScreen(a, run, data) {
+  const rs = $("runScreen");
+  const s = (run && run.summary) || {};
+  const best = s.best;
+  if (!rs) {   // markup missing — fall back to the main results area
+    if (data) { renderResults(Object.assign({}, data, { note: runScreenNote(a, run, data) })); }
+    if ($("results")) $("results").style.display = "block";
+    return;
+  }
+  renderResults(Object.assign({}, data, { note: runScreenNote(a, run, data) }),
+    { root: rs, ids: RUN_SCREEN_RESULT_IDS });
+  if ($("runScreenTitle")) $("runScreenTitle").textContent = `“${a ? a.name : "Automation"}” — run ${runNumber(a, run)} results`;
+  if ($("runScreenSub")) {
+    const bits = [new Date(run.at).toLocaleString()];
+    if (run.tookMs) bits.push(relMs(run.tookMs));
+    if (run.stopped) bits.push("stopped early");
+    if (!run.ok) bits.push("failed: " + (run.error || "error"));
+    $("runScreenSub").textContent = bits.join(" · ");
+  }
+  const price = $("runScreenPrice");
+  if (price) {
+    price.innerHTML = best && best.price != null
+      ? `<span class="run-screen-price-num">${_esc(best.price)} ${_esc(s.currency || best.currency || "")}</span>` +
+        `<span class="run-screen-price-lbl">cheapest in this run · ${_esc(best.route)}</span>`
+      : `<span class="run-screen-price-lbl">${run && run.ok ? "no flights found" : "run failed"}</span>`;
+  }
+  rs.style.display = "flex";
+  try { document.body.classList.add("run-screen-open"); } catch (e) {}
+  try { if ($("runScreenBack")) $("runScreenBack").focus(); } catch (e) {}
+  try { rs.scrollTop = 0; } catch (e) {}
+}
+
+function runScreenNote(a, run, data) {
+  return `Archived automation run — “${a ? a.name : "Automation"}”, run ${runNumber(a, run)}, ` +
+    `${new Date(run.at).toLocaleString()}${run && run.stopped ? " (stopped early)" : ""}. ` +
+    `Kept locally with the full results list (last ${AUTOMATION_RUNS_KEPT} runs per automation). ` + ((data && data.note) || "");
+}
+
+function hideRunScreen() {
+  const rs = $("runScreen");
+  if (!rs) return;
+  rs.style.display = "none";
+  try { document.body.classList.remove("run-screen-open"); } catch (e) {}
+}
+
 /* ---------- actions ---------- */
-function runAutomationById(id, manual) {
+function runAutomationById(id, manual, resume) {
   const a = _automations.find((x) => x.id === id);
   if (!a) return Promise.resolve(false);
   if (_searchInFlight) { autoStatus("A search is already running — try again when it finishes."); return Promise.resolve(false); }
-  const p = runAutomation(a, manual)
+  const p = runAutomation(a, manual, resume)
     .catch(() => {})
     .then(() => { if (_automationRunPromise === p) _automationRunPromise = null; });
   _automationRunPromise = p;
@@ -2774,9 +2917,6 @@ function editAutomation(id) {
   if ($("autoIntervalUnit")) $("autoIntervalUnit").value = unit;
   if ($("autoActiveFrom")) $("autoActiveFrom").value = a.activeFrom || "";
   if ($("autoActiveTo")) $("autoActiveTo").value = a.activeTo || "";
-  if ($("autoLeadDays")) $("autoLeadDays").value = String(a.leadDays != null ? a.leadDays : 30);
-  if ($("autoFast")) $("autoFast").checked = a.fast !== false;
-  if ($("autoReanchor")) $("autoReanchor").checked = !!a.reanchor;
   if ($("autoNotify")) $("autoNotify").checked = a.notify !== false;
   if ($("autoCancel")) $("autoCancel").style.display = "inline-flex";
   renderAutoCriteria();
@@ -2789,13 +2929,10 @@ function viewArchivedRun(aid, rid) {
   const a = _automations.find((x) => x.id === aid);
   const run = a && a.runs.find((r) => r.id === rid);
   if (!run || !run.data) { autoStatus("That archived run has no stored results."); return; }
-  renderResults(Object.assign({}, run.data, {
-    note: `Archived automation run — “${a.name}”, ${new Date(run.at).toLocaleString()}. ${run.data.note || ""}`,
-  }));
-  $("results").style.display = "block";
-  autoStatus(`Showing the archived run from ${new Date(run.at).toLocaleString()}.`);
-  try { if ($("results") && $("results").scrollIntoView) $("results").scrollIntoView({ behavior: "smooth", block: "start" }); } catch (e) {}
-  try { if ($("automationsCard")) $("automationsCard").open = false; } catch (e) {}
+  // The archived run opens in its own screen; “← Back” returns to the main
+  // screen exactly as it was, ready for a single search or a new automation.
+  showRunScreen(a, run, run.data);
+  autoStatus(`Showing run ${runNumber(a, run)} of “${a.name}” from ${new Date(run.at).toLocaleString()}.`);
 }
 
 async function runAllEnabled() {
@@ -2881,8 +3018,7 @@ function renderAutoCriteria() {
   const el = $("autoCriteria");
   if (!el) return;
   const p = readFormParams();
-  const fast = $("autoFast") ? $("autoFast").checked : true;
-  el.innerHTML = autoCriteriaText(p, fast) + "<br><span class=\"hint\">Criteria are taken directly from the main search form.</span>";
+  el.innerHTML = autoCriteriaText(p) + "<br><span class=\"hint\">Criteria are taken directly from the main search form.</span>";
 }
 
 function resetAutoForm() {
@@ -2892,10 +3028,7 @@ function resetAutoForm() {
   set("autoIntervalUnit", "60");
   set("autoActiveFrom", "");
   set("autoActiveTo", "");
-  set("autoLeadDays", "30");
   const chk = (id, v) => { const el = $(id); if (el) el.checked = v; };
-  chk("autoFast", true);
-  chk("autoReanchor", false);
   chk("autoNotify", true);
   if ($("autoCancel")) $("autoCancel").style.display = "none";
 }
@@ -2921,10 +3054,6 @@ function saveAutoFromForm() {
     name,
     intervalMinutes: num * unit,
     params: JSON.parse(JSON.stringify(params)),
-    windowDays: windowDaysOf(params),
-    fast: !$("autoFast") || !!$("autoFast").checked,
-    reanchor: !!( $("autoReanchor") && $("autoReanchor").checked),
-    leadDays: Math.max(0, parseInt($("autoLeadDays") && $("autoLeadDays").value, 10) || 0),
     activeFrom: from,
     activeTo: to,
     notify: !$("autoNotify") || !!$("autoNotify").checked,
@@ -2966,7 +3095,15 @@ function updateAutomationBadge() {
   if (!el) return;
   if (_automationRunningId) {
     const a = _automations.find((x) => x.id === _automationRunningId);
-    el.textContent = a ? "running: " + a.name : "running";
+    const p = _autoProgress;
+    const step = p && p.total ? ` ${p.done}/${p.total}` : "";
+    el.textContent = (a ? "running: " + a.name : "running") + step;
+    el.className = "auto-badge running";
+    return;
+  }
+  const rec = readAutoProgress();
+  if (rec && Date.now() - (rec.at || 0) <= AUTORUN_FRESH_MS) {
+    el.textContent = `paused: ${rec.name || "run"} ${rec.done || 0}/${rec.total || 0}`;
     el.className = "auto-badge running";
     return;
   }
@@ -2983,24 +3120,34 @@ function refreshAutomationTimers() {
   });
 }
 
-function runRowHtml(a, run) {
+function runRowHtml(a, run, cheapestId) {
   const s = run.summary || {};
-  let best, when;
+  let head, meta;
   if (!run.ok) {
-    best = `<span style="color:var(--danger)">failed: ${_esc(run.error || "error")}</span>`;
-    when = _esc(new Date(run.at).toLocaleString());
+    head = `<span class="auto-run-price bad">failed</span> ${_esc(run.error || "error")}`;
+    meta = "";
   } else if (s.best && s.best.price != null) {
-    best = `<strong>${s.best.price} ${_esc(s.currency || "")}</strong> · ${_esc(s.best.route)} · ${_esc(s.best.when)} · ${_esc(s.best.ticket || "")}`;
-    when = _esc(new Date(run.at).toLocaleString()) + (run.tookMs ? ` · ${_esc(relMs(run.tookMs))}` : "");
+    // The headline of the row *is* the cheapest flight found, so the list of
+    // completed runs can be scanned for the best price at a glance.
+    head = `<span class="auto-run-price">${_esc(s.best.price)} ${_esc(s.currency || s.best.currency || "")}</span>` +
+      ` · ${_esc(s.best.route)}` + (s.best.when ? ` · ${_esc(s.best.when)}` : "");
+    const bits = [new Date(run.at).toLocaleString()];
+    if (run.tookMs) bits.push(_esc(relMs(run.tookMs)));
+    if (s.lookups) bits.push(`${s.lookups} lookups`);
+    if (s.best.airline) bits.push(_esc(s.best.airline));
+    if (s.best.ticket) bits.push(_esc(s.best.ticket));
+    meta = bits.join(" · ");
   } else {
-    best = "no flights found";
-    when = _esc(new Date(run.at).toLocaleString());
+    head = `<span class="auto-run-price">no flights found</span>`;
+    meta = _esc(new Date(run.at).toLocaleString());
   }
   const view = run.data
     ? `<button type="button" class="btn-mini ghost" data-auto-view="${a.id}|${run.id}">View results</button>` : "";
   return `<div class="auto-run" role="button" tabindex="0" data-auto-view="${a.id}|${run.id}">
-    <span class="auto-run-when">${when}</span>
-    <span class="auto-run-best">${best}</span>
+    <span class="auto-run-no">Run ${_esc(runNumber(a, run))}</span>
+    <span class="auto-run-head">${head}</span>
+    ${meta ? `<span class="auto-run-meta">${meta}</span>` : ""}
+    ${cheapestId && cheapestId === run.id ? '<span class="auto-tag best">CHEAPEST</span>' : ""}
     ${run.stopped ? '<span class="auto-tag">stopped early</span>' : ""}
     ${view}
   </div>`;
@@ -3010,6 +3157,8 @@ function automationCardHtml(a) {
   const enabled = a.enabled !== false;
   const runs = a.runs || [];
   const last = runs[0];
+  const cheap = cheapestRun(a);
+  let lastTxt;
   if (!last) {
     lastTxt = "no runs yet";
   } else if (!last.ok) {
@@ -3020,8 +3169,11 @@ function automationCardHtml(a) {
     lastTxt = `${new Date(last.at).toLocaleString()} — ok${last.stopped ? " (stopped early)" : ""}`;
   }
   const win = (a.activeFrom && a.activeTo) ? ` · only ${_esc(a.activeFrom)}–${_esc(a.activeTo)}` : "";
+  const cheapPill = cheap
+    ? `<div class="auto-cheap">Cheapest this automation has found: <strong>${_esc(cheap.price)} ${_esc(cheap.currency)}</strong> · ${_esc(cheap.best.route)} · ${_esc(cheap.best.when || "")}${cheap.best.airline ? " · " + _esc(cheap.best.airline) : ""}</div>`
+    : "";
   const history = runs.length
-    ? `<details class="auto-history" open><summary>Archive — ${runs.length} run${runs.length === 1 ? "" : "s"} (last ${AUTOMATION_RUNS_KEPT} kept)</summary>${runs.map((r) => runRowHtml(a, r)).join("")}</details>`
+    ? `<details class="auto-history" open><summary>Archive — ${runs.length} run${runs.length === 1 ? "" : "s"} (last ${AUTOMATION_RUNS_KEPT} kept). Click any run to open its results.</summary>${runs.map((r) => runRowHtml(a, r, cheap ? cheap.run.id : null)).join("")}</details>`
     : `<p class="auto-empty">No runs archived yet.</p>`;
   return `<div class="auto-item ${enabled ? "" : "off"}">
     <div class="auto-item-top">
@@ -3035,7 +3187,8 @@ function automationCardHtml(a) {
         <button type="button" class="btn-mini ghost" data-auto-del="${a.id}">Delete</button>
       </span>
     </div>
-    <div class="auto-meta">${autoCriteriaText(a.params, a.fast)}</div>
+    <div class="auto-meta">${autoCriteriaText(a.params)}</div>
+    ${cheapPill}
     ${history}
   </div>`;
 }
@@ -3045,7 +3198,7 @@ function renderAutomations() {
   if (!list) return;
   updateAutomationBadge();
   if (!_automations.length) {
-    list.innerHTML = `<p class="hint">No automations yet. Set your search criteria above, choose an interval, then press “Use current form criteria” → “Save automation”.</p>`;
+    list.innerHTML = `<p class="hint">No automations yet. Set your search criteria above, choose an interval, then press “Save automation using current main form criteria”.</p>`;
     return;
   }
   list.innerHTML = _automations.map(automationCardHtml).join("");
@@ -3055,12 +3208,52 @@ function renderAutomations() {
 function automationTick() {
   refreshAutomationTimers();
   if (_automationTickTimer) { /* already scheduled */ }
+  if (_autoResumePending) return;   // an interrupted run is being continued
   if (!_automations.length || _searchInFlight) return;
   // Resolving airport names needs the airport data, so wait until it is loaded.
   if (!Object.keys(AIRPORTS).length) return;
   const now = Date.now();
   const due = _automations.find((a) => a.enabled !== false && automationNextRunAt(a) <= now);
   runAutomationById(due.id, false);
+}
+
+/** Run `fn` once the airport table is in (or give up after ~20s). */
+function _afterAirports(fn) {
+  let tries = 0;
+  const step = () => {
+    if (Object.keys(AIRPORTS).length || tries++ > 100) { try { fn(); } catch (e) {} return; }
+    try { setTimeout(step, 200); } catch (e) { try { fn(); } catch (e2) {} }
+  };
+  step();
+}
+
+/**
+ * A run that was interrupted (phone locked, tab closed, page reloaded) is
+ * continued from its checkpoint instead of starting over. Returns true when a
+ * continuation was started, so the caller does not also fire the first tick.
+ */
+function tryResumeInterruptedAutomation() {
+  let rec = null;
+  try { rec = readAutoProgress(); } catch (e) {}
+  if (!rec) return false;
+  if (Date.now() - (rec.at || 0) > AUTORUN_FRESH_MS) { clearAutoProgress(); return false; }
+  const a = _automations.find((x) => x.id === rec.automationId);
+  const stored = readStoredRun();
+  if (!a) { clearAutoProgress(); clearStoredRun(); return false; }
+  if (!stored || stored.autoId !== a.id) {
+    // Nothing to continue from — say so, and let the normal schedule restart it.
+    clearAutoProgress();
+    autoStatus(`The interrupted run of “${a.name}” could not be continued — it restarts on its next slot.`);
+    return false;
+  }
+  _autoResumePending = true;
+  autoStatus(`Continuing the interrupted run of “${a.name}” (${stored.done.length} lookups already done)…`);
+  _afterAirports(() => {
+    _autoResumePending = false;
+    if (_searchInFlight) return;
+    runAutomationById(a.id, true, { done: stored.done, options: stored.options });
+  });
+  return true;
 }
 
 function initAutomations() {
@@ -3072,13 +3265,17 @@ function initAutomations() {
   renderAutomations();
 
   $("automationList").addEventListener("click", onAutomationListClick);
-  if ($("autoCapture")) {
-    $("autoCapture").addEventListener("click", () => {
-      renderAutoCriteria();
-      autoStatus("Criteria reflect the main form above.");
-      try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
-    });
-  }
+  if ($("runScreenBack")) $("runScreenBack").addEventListener("click", hideRunScreen);
+  document.addEventListener("keydown", (e) => {
+    if ((e.key === "Escape" || e.key === "Backspace") && $("runScreen") && $("runScreen").style.display !== "none") {
+      // Backspace is only a shortcut when the user is not typing in a field.
+      const t = e.target;
+      const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+      if (e.key === "Backspace" && typing) return;
+      e.preventDefault();
+      hideRunScreen();
+    }
+  });
   if ($("autoSave")) $("autoSave").addEventListener("click", () => {
     _autoDraftParams = null;
     saveAutoFromForm();
@@ -3090,7 +3287,6 @@ function initAutomations() {
     renderAutoCriteria();
     autoStatus("Edit cancelled.");
   });
-  if ($("autoFast") && $("autoFast").addEventListener) $("autoFast").addEventListener("change", renderAutoCriteria);
   if ($("autoRunAll")) $("autoRunAll").addEventListener("click", () => { runAllEnabled(); });
   if ($("autoExport")) $("autoExport").addEventListener("click", exportAutomations);
   if ($("autoImport")) $("autoImport").addEventListener("click", () => { if ($("autoImportFile")) $("autoImportFile").click(); });
@@ -3100,11 +3296,18 @@ function initAutomations() {
     e.target.value = "";
   });
 
+  // Anything interrupted is continued first — that is the progress the user
+  // sees when they unlock the phone or reopen the app.
+  let resuming = false;
+  try { resuming = tryResumeInterruptedAutomation(); } catch (e) {}
+
   if (_automationTickTimer) clearInterval(_automationTickTimer);
   _automationTickTimer = setInterval(automationTick, AUTOMATION_TICK_MS);
   // Run the first tick soon after init so any overdue automations (e.g. missed
   // while the tab was closed) fire promptly without waiting for the first 20s.
-  try { setTimeout(() => { try { automationTick(); } catch (e) {} }, 250); } catch (e) {}
+  if (!resuming) {
+    try { setTimeout(() => { try { automationTick(); } catch (e) {} }, 250); } catch (e) {}
+  }
   refreshAutomationTimers();
 }
 
@@ -3248,6 +3451,7 @@ function wire() {
     $("errorBox").style.display = "none";
     $("results").style.display = "none";
     $("resumeBox").style.display = "none";
+    hideRunScreen();
     $("progress").style.display = "block";
     $("progress").textContent = "Contacting the reader…";
     const btn = $("submitBtn");
@@ -3346,8 +3550,10 @@ function wire() {
   if ($("stopCancel")) $("stopCancel").addEventListener("click", () => resetStopConfirm());
 
   // A long exhaustive sweep can outlive a reload, so offer to continue it.
+  // An automation tags its own checkpoints and continues them by itself, so the
+  // generic banner only ever offers a *manual* search back to the user.
   const stored = readStoredRun();
-  if (stored) {
+  if (stored && !stored.autoId) {
     const when = new Date(stored.saved || Date.now()).toLocaleString();
     $("resumeText").textContent =
       `Unfinished search from ${when}: ${stored.done.length} lookups already done for ` +
