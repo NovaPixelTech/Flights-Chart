@@ -2712,6 +2712,7 @@ async function runAutomation(a, manual) {
 
   saveAutomations();
   renderAutomations();
+  try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
 
   if (data) {
     renderResults(Object.assign({}, data, {
