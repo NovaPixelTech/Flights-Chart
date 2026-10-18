@@ -2762,7 +2762,7 @@ function editAutomation(id) {
   const a = _automations.find((x) => x.id === id);
   if (!a) return;
   _editingAutomationId = id;
-  _autoDraftParams = JSON.parse(JSON.stringify(a.params || {}));
+  _autoDraftParams = null;
   if ($("autoName")) $("autoName").value = a.name || "";
   const mins = a.intervalMinutes || 60;
   let num = mins, unit = "1";
@@ -2879,12 +2879,9 @@ function importAutomations(file) {
 function renderAutoCriteria() {
   const el = $("autoCriteria");
   if (!el) return;
-  if (!_autoDraftParams) {
-    el.textContent = "No criteria captured yet — set the search form above, then press “Use current form criteria” (pressing Save also captures the form as it is right now).";
-    return;
-  }
+  const p = readFormParams();
   const fast = $("autoFast") ? $("autoFast").checked : true;
-  el.innerHTML = autoCriteriaText(_autoDraftParams, fast);
+  el.innerHTML = autoCriteriaText(p, fast) + "<br><span class=\"hint\">Criteria are taken directly from the main search form.</span>";
 }
 
 function resetAutoForm() {
@@ -2912,9 +2909,9 @@ function saveAutoFromForm() {
     autoStatus("Set both the “from” and “to” times, or leave both blank for “any time”.");
     return;
   }
-  const params = _autoDraftParams || readFormParams();
+  const params = readFormParams();
   if (!params.origin || !params.destination) {
-    autoStatus("Fill in From and To (or capture the form criteria) before saving.");
+    autoStatus("Fill in From and To in the main search form before saving an automation.");
     return;
   }
   const existing = _editingAutomationId ? _automations.find((x) => x.id === _editingAutomationId) : null;
@@ -3069,23 +3066,20 @@ function initAutomations() {
   if (!$("automationList")) return;
   loadAutomations();
   resetAutoForm();
-  _autoDraftParams = readFormParams();
+  _autoDraftParams = null;
   renderAutoCriteria();
   renderAutomations();
 
   $("automationList").addEventListener("click", onAutomationListClick);
   if ($("autoCapture")) {
     $("autoCapture").addEventListener("click", () => {
-      _autoDraftParams = readFormParams();
       renderAutoCriteria();
-      autoStatus("Criteria captured from the form above.");
+      autoStatus("Criteria reflect the main form above.");
       try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
     });
-  } else if ($("autoSave")) {
-    // If "Use current form criteria" is missing, Save still captures the form.
   }
   if ($("autoSave")) $("autoSave").addEventListener("click", () => {
-    if (!_autoDraftParams) _autoDraftParams = readFormParams();
+    _autoDraftParams = null;
     saveAutoFromForm();
   });
   if ($("autoCancel")) $("autoCancel").addEventListener("click", () => {
