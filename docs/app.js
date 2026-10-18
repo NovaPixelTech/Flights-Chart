@@ -1826,6 +1826,77 @@ function _returnCell(f) {
   return `<span class="dir-unavailable">—</span>`;
 }
 
+/* ------------------------------------------------------------------ *
+ *  "Compare on other sites" deep links
+ *
+ *  Google Flights is what we price from; these links let you check the very
+ *  same route and dates on a couple of other sellers.
+ *  - Kiwi.com and Skyscanner accept a prefilled URL (IATA codes + dates), so
+ *    the button lands straight on the matching search.
+ *  - Gotogate has NO prefillable URL: its search is driven by a server-issued
+ *    session key (and it serves HTTP 403 to non-browser clients), so a link
+ *    can only open its home page. See the README for the full explanation.
+ * ------------------------------------------------------------------ */
+function _yymmdd(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ""));
+  return m ? m[1].slice(2) + m[2] + m[3] : "";
+}
+
+/** True only when the option is a return to the same departure airport (so a
+ *  single round-trip URL is faithful). Open-jaw returns from elsewhere. */
+function _isRoundTripLink(f) {
+  return !!(f && f.return_date && f.return_date !== f.outbound_date && !f.open_jaw &&
+    (f.return_airport || f.origin_airport) === f.origin_airport);
+}
+
+function _kiwiCompareUrl(f, currency) {
+  if (!f || !f.origin_airport || !f.dest_airport || !f.outbound_date) return null;
+  const q = [
+    "from=" + encodeURIComponent(f.origin_airport),
+    "to=" + encodeURIComponent(f.dest_airport),
+    "departure=" + encodeURIComponent(f.outbound_date),
+  ];
+  if (_isRoundTripLink(f)) q.push("return=" + encodeURIComponent(f.return_date));
+  q.push("adults=1", "lang=en");
+  if (currency) q.push("currency=" + encodeURIComponent(currency));
+  return "https://www.kiwi.com/deep?" + q.join("&");
+}
+
+function _skyscannerCompareUrl(f, directOnly) {
+  if (!f || !f.origin_airport || !f.dest_airport || !f.outbound_date) return null;
+  const o = String(f.origin_airport).toLowerCase();
+  const d = String(f.dest_airport).toLowerCase();
+  let u = `https://www.skyscanner.net/transport/flights/${o}/${d}/${_yymmdd(f.outbound_date)}`;
+  if (_isRoundTripLink(f)) u += `/${_yymmdd(f.return_date)}`;
+  u += "/";
+  const q = ["adults=1", "adultsv2=1"];
+  if (directOnly) q.push("preferdirects=true");
+  return u + "?" + q.join("&");
+}
+
+/** The whole "compare on other sites" card, built from one representative
+ *  option (the cheapest overall). Returns "" when there is nothing to link. */
+function _compareLinksBlock(f, currency, directOnly) {
+  if (!f || !f.origin_airport || !f.dest_airport || !f.outbound_date) return "";
+  const route = `${f.origin_airport} → ${f.dest_airport}`;
+  const dates = _isRoundTripLink(f)
+    ? `${fmtDate(f.outbound_date)} – ${fmtDate(f.return_date)}`
+    : `${fmtDate(f.outbound_date)} · one-way${f.open_jaw ? " (open-jaw: outbound only)" : ""}`;
+  const links = [];
+  const kiwi = _kiwiCompareUrl(f, currency);
+  const sky = _skyscannerCompareUrl(f, directOnly);
+  if (kiwi) links.push(`<a class="cmp-link" href="${kiwi}" target="_blank" rel="noopener noreferrer">Kiwi.com ↗</a>`);
+  if (sky) links.push(`<a class="cmp-link" href="${sky}" target="_blank" rel="noopener noreferrer">Skyscanner ↗</a>`);
+  links.push(`<a class="cmp-link cmp-link-muted" href="https://www.gotogate.com/" target="_blank" rel="noopener noreferrer" ` +
+    `title="Gotogate has no link that can prefill a search, so this opens its home page where you re-enter the route and dates.">Gotogate ↗</a>`);
+  return `
+    <div class="compare-card">
+      <div class="compare-title">Compare on other sites — <strong>${route}</strong> · ${dates}</div>
+      <div class="compare-links">${links.join("")}</div>
+      <div class="compare-note">Prefilled from the cheapest option found (route, dates, 1 adult). Kiwi.com and Skyscanner open that exact search; Gotogate cannot be prefilled by a link, so it opens its home page. Prices there are in that site's own currency and may differ from Google's.</div>
+    </div>`;
+}
+
 function renderResults(data) {
   const originList = (data.origins_searched || []).map((a) => a.code).join(", ");
   const destList = (data.destinations_searched || []).map((a) => a.code).join(", ");
@@ -1879,6 +1950,15 @@ function renderResults(data) {
   html += bookSections.join("");
 
   const ranked = data.ranked_options || [];
+
+  // Cross-site comparison card, built from the cheapest option found so the
+  // links point at the exact route + dates that produced the best price.
+  const bestForCompare = ranked.length
+    ? ranked[0]
+    : (data.cheapest_roundtrip || data.cheapest_oneway ||
+       data.cheapest_roundtrip_direct || data.cheapest_oneway_direct || null);
+  html += _compareLinksBlock(bestForCompare, cur, data.direct_only);
+
   if (ranked.length) {
     const shown = ranked.length;
     const total = data.all_results_count || shown;

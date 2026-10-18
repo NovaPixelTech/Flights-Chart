@@ -10,7 +10,8 @@ Supports country inputs (expands to **every** commercial airport in that country
 are searched), explicit airport lists (`DUS, FRA, HAM`), flexible date windows, stay-length
 ranges, open-jaw (different return airport), and an optional **direct-only (nonstop)** filter.
 Every result lists the **outbound and the return** flight (airport, `dd.mm.yyyy` date with the
-weekday, times, airline) plus the number of stay days.
+weekday, times, airline) plus the number of stay days. The results also carry a small card that
+**cross-checks the cheapest route on Kiwi.com and Skyscanner** (prefilled links) and on Gotogate.
 
 By default a search is **exhaustive**: every resolved airport pair, every stay length and **every
 departure date that fits the window** is queried, so the cheapest option reported really is the
@@ -84,6 +85,13 @@ Everything runs in `docs/app.js`. It is a self-contained JavaScript port of the
   static `docs/favicon.svg` for the tab when idle, and a canvas-painted animated plane/check
   favicon while a search runs). Animation only runs while a search is active, and it is disabled
   under `prefers-reduced-motion`.
+- **Cross-check on other sites** — under the results a small card links the **cheapest option
+  found** (its route, dates and one adult) to **Kiwi.com** and **Skyscanner**, whose search URLs
+  can be prefilled, so the button lands straight on the matching search. **Gotogate** is offered
+  too, but only as a link to its home page — it has no prefillable search URL (see
+  [Cross-check on other sites](#cross-check-on-other-sites-kiwicom-skyscanner-gotogate)). These are
+  plain outbound links: nothing is fetched from those sites, no key is used, and the app still
+  makes **only** the reader call described above.
 
 > **No secret is embedded and nothing is exposed.** The reader request and the (already
 > public) Google Flights page are the only network calls.
@@ -128,6 +136,41 @@ leave.
 If a stay cannot fit the window at all (e.g. a 20-day stay in a 8-day window), the app says so
 instead of quietly returning nothing, and suggests widening the window, shortening the stay, or
 switching to *Departure date only*.
+
+## Cross-check on other sites (Kiwi.com, Skyscanner, Gotogate)
+
+Google Flights is what this app prices from. To sanity-check the best fare elsewhere, the results
+carry a small **"Compare on other sites"** card. It is built from the **cheapest option the sweep
+found**, and it reuses that option's route, dates and one adult:
+
+| Site | What the link does |
+| --- | --- |
+| **Kiwi.com** | Opens a prefilled search: `https://www.kiwi.com/deep?from=DUS&to=ATH&departure=2026-12-06&return=2026-12-12&adults=1&lang=en&currency=EUR`. For a one-way (or an open-jaw, whose return is not on this route) the `return=` parameter is omitted, which makes Kiwi search a one-way. |
+| **Skyscanner** | Opens a prefilled search: `https://www.skyscanner.net/transport/flights/dus/ath/261206/261212/?adults=1&adultsv2=1`. Dates are `YYMMDD` path segments; a one-way uses a single date segment; the direct-only filter adds `preferdirects=true`. |
+| **Gotogate** | Opens `https://www.gotogate.com/` — its **home page**, with no prefilled search. |
+
+**Why Gotogate can't be prefilled.** Gotogate (like its siblings Mytrip/BudgetAir, all part of
+Etraveli Group) is a JavaScript single-page app whose search is driven by a **server-issued
+selection key** obtained through a GraphQL call — the only URL parameters its client code reads are
+affiliate/UTM ones, never route or dates. Every candidate deep link was tested against the live
+site and fails: `/searching-for-flights?...` answers
+`{"message":"Search parameters invalid. No flight-routes requested."}`, and `/start`, `/result`,
+`/flights/DUS/ATH`, `/rf/flights/dus-ath` all return `404`. On top of that, Gotogate serves
+**`HTTP 403 Access Denied`** (Akamai) to non-browser clients, so a static page could never query it
+directly anyway. A plain home-page link is the honest maximum — you re-enter the route and dates
+there.
+
+**No key, no scrape, no server.** All three are ordinary outbound links opened in a new tab
+(`target="_blank"` + `rel="noopener noreferrer"`). Nothing is fetched from those sites, so the
+app's only network call remains the reader request described above, and the page stays 100 %
+static. The card's own note states that prices on those sites are shown in **their** currency and
+may differ from Google's.
+
+> **If you need Gotogate's price shown *inside* the app**, the only route is a server-side proxy
+> with a paid API (e.g. SerpApi's Google Flights `booking_options`, which lists OTA prices such as
+> Gotogate/Mytrip/BudgetAir/Kiwi for a pinned itinerary). That needs a key and a backend, so it
+> does **not** belong in the static GitHub Pages app — it would fit the legacy Flask backend
+> (`app.py`) instead.
 
 ## Install it on your phone's home screen
 
@@ -239,7 +282,10 @@ python -m http.server 8000 --directory docs
   tab, so the run pauses there and continues when you return to it (nothing is lost: progress is
   checkpointed, and the *Resume* offer skips what was already done). Notifications also need the
   page to be added to the home screen on iOS.
-- Prices are live estimates only — not bookable through this app.
+- Prices are live estimates only — not bookable through this app. Booking-site comparisons
+  (Kiwi.com, Skyscanner, Gotogate) are **outbound links only** — see
+  [Cross-check on other sites](#cross-check-on-other-sites-kiwicom-skyscanner-gotogate); no OTA
+  price is fetched or shown inline (that would need a keyed backend API).
 - City resolution works for major cities (and expands to all of a city's hubs, e.g. London →
   LHR/LGW/STN/LCY); you can also list airports directly (`DUS, FRA, HAM`). An exact IATA code
   always resolves to that single airport.
