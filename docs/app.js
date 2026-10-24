@@ -2810,12 +2810,13 @@ async function runAutomation(a, manual, resume) {
   saveAutomations();
   renderAutomations();
   paintAutoProgress();
-  try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
+  try { if ($("automationsCard")) { /* keep collapsed unless the user opened it */ } } catch (e) {}
 
   if (data) {
     // The run gets its own screen, so the main screen is left exactly as the
     // user had it (a single search, or the form for a new automation).
-    showRunScreen(a, run, data);
+    // Results are saved in the archive; only clicking the run shows them on
+    // the dedicated screen.
   }
   notifyAutomationRun(a, run);
   autoStatus(error
@@ -2921,7 +2922,7 @@ function editAutomation(id) {
   if ($("autoCancel")) $("autoCancel").style.display = "inline-flex";
   renderAutoCriteria();
   autoStatus(`Editing “${a.name}” — save to apply.`);
-  try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
+  /* do not force the Automations card open */
   try { if ($("autoName") && $("autoName").scrollIntoView) $("autoName").scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
 }
 
@@ -3070,7 +3071,7 @@ function saveAutoFromForm() {
   renderAutoCriteria();
   renderAutomations();
   autoStatus(`Saved “${a.name}” — every ${relMs(automationIntervalMs(a))}, ${nextRunText(a)}.`);
-  try { if ($("automationsCard")) $("automationsCard").open = true; } catch (e) {}
+  /* keep automations collapsed; the user opens it if they want to see it */
 }
 
 function onAutomationListClick(e) {
@@ -3173,7 +3174,7 @@ function automationCardHtml(a) {
     ? `<div class="auto-cheap">Cheapest this automation has found: <strong>${_esc(cheap.price)} ${_esc(cheap.currency)}</strong> · ${_esc(cheap.best.route)} · ${_esc(cheap.best.when || "")}${cheap.best.airline ? " · " + _esc(cheap.best.airline) : ""}</div>`
     : "";
   const history = runs.length
-    ? `<details class="auto-history" open><summary>Archive — ${runs.length} run${runs.length === 1 ? "" : "s"} (last ${AUTOMATION_RUNS_KEPT} kept). Click any run to open its results.</summary>${runs.map((r) => runRowHtml(a, r, cheap ? cheap.run.id : null)).join("")}</details>`
+    ? `<details class="auto-history"><summary>Archive — ${runs.length} run${runs.length === 1 ? "" : "s"} (last ${AUTOMATION_RUNS_KEPT} kept). Click any run to open its results.</summary>${runs.map((r) => runRowHtml(a, r, cheap ? cheap.run.id : null)).join("")}</details>`
     : `<p class="auto-empty">No runs archived yet.</p>`;
   return `<div class="auto-item ${enabled ? "" : "off"}">
     <div class="auto-item-top">
